@@ -1,0 +1,12 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use app\application\Cli\CliApplication;
+
+chdir(dirname(__DIR__));
+require __DIR__ . '/../vendor/autoload.php';
+require __DIR__ . '/../support/bootstrap.php';
+
+exit((new CliApplication())->run($argv));
