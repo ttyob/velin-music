@@ -21,7 +21,10 @@ use support\Db;
  */
 final class ArtworkService
 {
-    public function __construct(private readonly EmbeddedArtworkSource $embedded = new EmbeddedArtworkExtractor())
+    public function __construct(
+        private readonly EmbeddedArtworkSource $embedded = new EmbeddedArtworkExtractor(),
+        private readonly ArtworkBlobStore $blobs = new ArtworkBlobStore(),
+    )
     {
     }
 
@@ -539,7 +542,11 @@ final class ArtworkService
      */
     private function resolveManual(stdClass $row, string $entityId): ResolvedArtwork
     {
-        $bytes = (string) $row->image_bytes;
+        try {
+            $bytes = $this->blobs->bytes($row);
+        } catch (\RuntimeException) {
+            throw new ArtworkUnavailable('MANUAL_ARTWORK_STORAGE_INVALID');
+        }
         $digest = (string) $row->content_sha256;
         if ((string) $row->mime_type !== 'image/webp' || strlen($bytes) !== (int) $row->byte_size
             || preg_match('/^[a-f0-9]{64}$/', $digest) !== 1 || !hash_equals($digest, hash('sha256', $bytes))) {

@@ -22,6 +22,10 @@ use app\application\System\NetworkProxySettingsUnavailable;
 use app\application\System\RuntimeMaintenanceInvalid;
 use app\application\System\RuntimeMaintenanceService;
 use app\application\System\RuntimeMaintenanceUnavailable;
+use app\application\Metadata\MetadataScrapePolicyConflict;
+use app\application\Metadata\MetadataScrapePolicyInvalid;
+use app\application\Metadata\MetadataScrapePolicyService;
+use app\application\Metadata\MetadataScrapePolicyUnavailable;
 use app\http\JsonResponseFactory;
 use app\http\RequestContext;
 use support\Log;
@@ -37,6 +41,34 @@ use Throwable;
  */
 final class SystemSettingsController
 {
+    /**
+     * 返回主程序统一的刮削字段优先级与繁转简策略。
+     *
+     * 授权在读取设置前完成；响应包含完整固定字段与版本，供弹窗执行 CAS 更新。该读取不启动刮削、不
+     * 重算历史数据，也不暴露插件私有配置或音频标签原始映射。
+     */
+    public function showMetadataScrapePolicy(Request $request): Response
+    {
+        return $this->execute($request, static fn (): array => (new MetadataScrapePolicyService())->get());
+    }
+
+    /**
+     * 原子保存完整刮削策略。
+     *
+     * actor 仅来自实时 Session，PUT 由路由 CSRF 中间件保护。服务会拒绝缺字段、未知枚举和旧版本；
+     * 成功只影响后续扫描与刮削，不静默覆盖历史入库值、歌词、封面或音频标签。
+     */
+    public function updateMetadataScrapePolicy(Request $request): Response
+    {
+        return $this->execute($request, static function (array $actor) use ($request): array {
+            $payload = $request->post();
+            if (!is_array($payload)) throw new MetadataScrapePolicyInvalid('刮削策略参数无效。');
+            return (new MetadataScrapePolicyService())->update(
+                $payload, (string) $actor['id'], RequestContext::requestId(),
+            );
+        });
+    }
+
     /**
      * 返回主程序固定运行维护分类的受管量和过期可清理量。
      *
@@ -197,6 +229,9 @@ final class SystemSettingsController
             if ($throwable instanceof RuntimeMaintenanceInvalid) {
                 return JsonResponseFactory::error('RUNTIME_MAINTENANCE_VALIDATION_FAILED', '清理分类无效。', 422, $requestId);
             }
+            if ($throwable instanceof MetadataScrapePolicyInvalid) {
+                return JsonResponseFactory::error('METADATA_SCRAPE_POLICY_VALIDATION_FAILED', '刮削配置参数无效。', 422, $requestId);
+            }
             if ($throwable instanceof RuntimeMaintenanceUnavailable) {
                 return JsonResponseFactory::error('RUNTIME_MAINTENANCE_UNAVAILABLE', '运行维护暂时不可用。', 503, $requestId);
             }
@@ -209,10 +244,14 @@ final class SystemSettingsController
             if ($throwable instanceof NetworkProxySettingsConflict) {
                 return JsonResponseFactory::error('NETWORK_PROXY_VERSION_CONFLICT', '代理配置已变化，请刷新后重试。', 409, $requestId);
             }
+            if ($throwable instanceof MetadataScrapePolicyConflict) {
+                return JsonResponseFactory::error('METADATA_SCRAPE_POLICY_VERSION_CONFLICT', '刮削配置已变化，请刷新后重试。', 409, $requestId);
+            }
             Log::error('System settings request failed.', ['request_id' => $requestId, 'exception_class' => $throwable::class]);
             $code = $throwable instanceof BasicSystemSettingsUnavailable
                 || $throwable instanceof SystemLimitSettingsUnavailable
                 || $throwable instanceof NetworkProxySettingsUnavailable
+                || $throwable instanceof MetadataScrapePolicyUnavailable
                 ? 'SYSTEM_SETTINGS_UNAVAILABLE'
                 : 'SYSTEM_SETTINGS_REQUEST_FAILED';
             return JsonResponseFactory::error($code, '系统设置暂时不可用。', 503, $requestId);

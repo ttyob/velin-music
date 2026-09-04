@@ -7,19 +7,19 @@ namespace app\application\Lyrics;
 use Throwable;
 
 /**
- * Materializes a validated embedded lyric tag as a non-overwriting sibling `.lrc` file.
+ * 把已验证的音频内嵌歌词非覆盖发布为同名 `.lrc`。
  *
- * This narrow writer is used only by the scan Worker. It first confirms the audio's canonical path
- * remains inside the immutable library root, then parses and normalizes bounded tag text. Content is
- * written and fsynced to an exclusive temporary file in the same directory. A hard-link publish is
- * used as an atomic no-replace operation: unlike rename(), it can never overwrite a target created
- * by another process between the existence check and publication. The temporary link is removed in
- * every exit path. No shell command is used and no caller-controlled filename is constructed.
+ * 本写入器只由扫描 Worker 使用。它先确认音频规范路径仍位于不可变音乐库根内，再解析有界标签正文，
+ * 并通过统一序列化器保留逐行或逐字时间轴。内容写入同目录独占临时文件、刷新后使用硬链接原子发布，
+ * 因而并发创建的目标不会被覆盖。任意失败都会清理本任务临时文件，不调用 shell、不使用标签标题构造
+ * 文件名，也不修改音频文件或既有 sidecar。
  */
 final class EmbeddedLyricsExporter
 {
-    public function __construct(private readonly LyricsParser $parser = new LyricsParser())
-    {
+    public function __construct(
+        private readonly LyricsParser $parser = new LyricsParser(),
+        private readonly LyricsDocumentSerializer $serializer = new LyricsDocumentSerializer(),
+    ) {
     }
 
     /**
@@ -69,7 +69,7 @@ final class EmbeddedLyricsExporter
             if (!is_resource($handle)) {
                 return new EmbeddedLyricsExportResult(true, 'not_writable', $parsed->kind);
             }
-            $content = $this->serialize($parsed);
+            $content = $this->serializer->serialize($parsed->kind, $parsed->lines);
             $offset = 0;
             while ($offset < strlen($content)) {
                 $written = fwrite($handle, substr($content, $offset));
@@ -133,25 +133,6 @@ final class EmbeddedLyricsExporter
         }
 
         return null;
-    }
-
-    /** Serializes normalized lines into deterministic UTF-8/LF content suitable for `.lrc`. */
-    private function serialize(ParsedLyrics $parsed): string
-    {
-        $lines = [];
-        foreach ($parsed->lines as $line) {
-            if ($line['startMs'] === null) {
-                $lines[] = $line['text'];
-                continue;
-            }
-            $milliseconds = (int) $line['startMs'];
-            $minutes = intdiv($milliseconds, 60_000);
-            $seconds = intdiv($milliseconds % 60_000, 1_000);
-            $fraction = $milliseconds % 1_000;
-            $lines[] = sprintf('[%02d:%02d.%03d]%s', $minutes, $seconds, $fraction, $line['text']);
-        }
-
-        return implode("\n", $lines) . "\n";
     }
 
     /** Allows deployments to disable library writes while preserving embedded recognition status. */

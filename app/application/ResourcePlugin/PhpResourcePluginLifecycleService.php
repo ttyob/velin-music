@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace app\application\ResourcePlugin;
 
 use app\application\ResourcePlugin\Contract\PluginDatabaseLifecycle;
+use app\application\ResourcePlugin\Contract\PluginDatabaseBaselineCollapse;
 use InvalidArgumentException;
 use stdClass;
 use support\Db;
@@ -52,7 +53,11 @@ final readonly class PhpResourcePluginLifecycleService
         /** @var stdClass|null $installed */
         $installed = Db::table('php_resource_plugin_migrations')->where('plugin_key', $key)->first();
         if ($installed instanceof stdClass && (int) $installed->database_version > $target) {
-            throw new PhpResourcePluginInvalid('PHP_PLUGIN_DATABASE_NEWER_THAN_CODE');
+            $legacyVersion = (int) $installed->database_version;
+            if (!$plugin instanceof PluginDatabaseBaselineCollapse
+                || !$plugin->supportsLegacyDatabaseVersion($legacyVersion)) {
+                throw new PhpResourcePluginInvalid('PHP_PLUGIN_DATABASE_NEWER_THAN_CODE');
+            }
         }
         if ($installed instanceof stdClass && (int) $installed->database_version === $target) {
             return ['pluginKey' => $key, 'databaseVersion' => $target, 'status' => 'current'];

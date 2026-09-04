@@ -126,11 +126,11 @@ final class ScanJobService
      * table contains only safe basenames and normalized display fields; this method never joins the
      * inventory path columns, so neither absolute nor relative directories can enter the response.
      *
-     * @return array{files: list<array<string, mixed>>, total: int, limit: int, offset: int}
+     * @return array{files: list<array<string, mixed>>, total: int, limit: int, offset: int, retained: bool}
      */
     public function listFileResults(string $jobId, array $actor, int $limit, int $offset): array
     {
-        $this->findJob($jobId, $actor);
+        $job = $this->findJob($jobId, $actor);
         $limit = max(1, min(100, $limit));
         $offset = max(0, min(1_000_000, $offset));
         $query = Db::table('library_scan_file_results')->where('scan_job_id', $jobId);
@@ -148,6 +148,7 @@ final class ScanJobService
             'total' => $total,
             'limit' => $limit,
             'offset' => $offset,
+            'retained' => (bool) $job['fileResultsRetained'],
         ];
     }
 
@@ -250,6 +251,7 @@ final class ScanJobService
                         $libraryId,
                         (string) $actor['id'],
                         $input->scanType,
+                        $input->relativePath,
                         $requestId,
                         $now,
                     ));
@@ -269,6 +271,7 @@ final class ScanJobService
                         array_filter([
                             'libraryId' => $libraryId,
                             'scanType' => $input->scanType,
+                            'relativePath' => $input->relativePath,
                             'retryOfJobId' => $retryOfJobId,
                         ], static fn (mixed $value): bool => $value !== null),
                     );
@@ -337,6 +340,7 @@ final class ScanJobService
                     $libraryId,
                     null,
                     'incremental',
+                    null,
                     $requestId,
                     $now,
                 ));
@@ -378,7 +382,7 @@ final class ScanJobService
         }
         return $this->createJobs(
             [(string) $source['library']['id']],
-            new ScanCreateInput((string) $source['scanType']),
+            new ScanCreateInput((string) $source['scanType'], $source['relativePath']),
             $actor,
             $requestId,
             $jobId,
@@ -472,6 +476,7 @@ final class ScanJobService
         string $libraryId,
         ?string $actorId,
         string $scanType,
+        ?string $relativePath,
         string $requestId,
         string $now,
     ): array {
@@ -480,6 +485,7 @@ final class ScanJobService
             'library_id' => $libraryId,
             'requested_by' => $actorId,
             'scan_type' => $scanType,
+            'relative_path' => $relativePath,
             'status' => 'queued',
             'phase' => 'queued',
             'processed_entries' => 0,
@@ -520,8 +526,8 @@ final class ScanJobService
     /** @return list<string> */
     private function jobColumns(): array
     {
-        return [
-            'jobs.id', 'jobs.scan_type', 'jobs.status', 'jobs.phase', 'jobs.processed_entries',
+        $columns = [
+            'jobs.id', 'jobs.scan_type', 'jobs.relative_path', 'jobs.status', 'jobs.phase', 'jobs.processed_entries',
             'jobs.discovered_files', 'jobs.added_files', 'jobs.missing_files',
             'jobs.ignored_entries', 'jobs.failed_entries', 'jobs.attempt', 'jobs.heartbeat_at',
             'jobs.metadata_parsed_files', 'jobs.metadata_failed_files', 'jobs.updated_files',
@@ -531,6 +537,10 @@ final class ScanJobService
             'libraries.id as library_id', 'libraries.name as library_name',
             'requesters.display_name as requester_name',
         ];
+        $columns[] = Db::connection()->getSchemaBuilder()->hasColumn('library_scan_jobs', 'file_results_pruned_at')
+            ? 'jobs.file_results_pruned_at'
+            : Db::raw('NULL AS file_results_pruned_at');
+        return $columns;
     }
 
     /** @return array<string, mixed> */
@@ -540,6 +550,7 @@ final class ScanJobService
             'id' => (string) $row->id,
             'library' => ['id' => (string) $row->library_id, 'name' => (string) $row->library_name],
             'scanType' => (string) $row->scan_type,
+            'relativePath' => $row->relative_path === null ? null : (string) $row->relative_path,
             'status' => (string) $row->status,
             'phase' => (string) $row->phase,
             'processedEntries' => (int) $row->processed_entries,
@@ -564,6 +575,7 @@ final class ScanJobService
             ],
             'createdAt' => (string) $row->created_at,
             'updatedAt' => (string) $row->updated_at,
+            'fileResultsRetained' => $row->file_results_pruned_at === null,
         ];
     }
 

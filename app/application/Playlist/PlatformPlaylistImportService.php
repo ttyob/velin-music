@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\Playlist;
 
+use app\application\Artist\ArtistNameIdentityNormalizer;
 use app\application\Media\MediaQueryService;
 use app\application\Search\SearchTextNormalizer;
 use app\http\RequestContext;
@@ -28,6 +29,7 @@ final readonly class PlatformPlaylistImportService
         private MediaQueryService $media = new MediaQueryService(),
         private PlaylistService $playlists = new PlaylistService(),
         private ?PluginPlaylistIdentificationGateway $playlistIdentifier = null,
+        private ArtistNameIdentityNormalizer $artistNames = new ArtistNameIdentityNormalizer(),
     ) {
     }
 
@@ -158,7 +160,9 @@ final readonly class PlatformPlaylistImportService
                 'sourceArtists' => $entry->artists,
                 'sourceAlbum' => $entry->album,
             ];
-            $artists = array_values(array_unique(array_map([$normalizer, 'normalize'], $entry->artists)));
+            $artists = [];
+            foreach ($entry->artists as $artist) $artists = [...$artists, ...$this->artistNames->lookupKeys($artist)];
+            $artists = array_values(array_unique($artists));
             if ($entry->title === '' || $artists === []) {
                 $counts['unsupported']++;
                 $reportEntries[] = ['ordinal' => $position + 1, 'status' => 'unsupported'];

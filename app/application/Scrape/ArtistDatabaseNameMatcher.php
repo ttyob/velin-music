@@ -4,7 +4,8 @@ declare(strict_types=1);
 
 namespace app\application\Scrape;
 
-use app\application\Search\SearchTextNormalizer;
+use app\application\Artist\ArtistNameIdentityNormalizer;
+use app\application\Storage\StorageLayout;
 use PDO;
 use Throwable;
 
@@ -29,8 +30,8 @@ final class ArtistDatabaseNameMatcher implements ArtistNameLookup
      * query_only 连接，因而未安装辅助库不会增加普通扫描启动成本。
      */
     public function __construct(
-        private readonly string $databasePath = '/media/cache/artist-database/musicbrainz_artists_zh.sqlite',
-        private readonly SearchTextNormalizer $normalizer = new SearchTextNormalizer(),
+        private readonly string $databasePath = StorageLayout::ARTIST_DATABASE_PATH,
+        private readonly ArtistNameIdentityNormalizer $normalizer = new ArtistNameIdentityNormalizer(),
     ) {
     }
 
@@ -43,7 +44,7 @@ final class ArtistDatabaseNameMatcher implements ArtistNameLookup
     public function contains(string $name): bool
     {
         $name = trim($name);
-        $needle = $this->normalizer->normalize($name);
+        $needle = $this->normalizer->identityKey($name);
         if ($needle === '' || mb_strlen($name, 'UTF-8') > 160 || $this->unavailable) return false;
         if (array_key_exists($needle, $this->cache)) return $this->cache[$needle];
         try {
@@ -66,7 +67,7 @@ SQL);
             $statement->execute(['query' => '"' . str_replace('"', '""', $name) . '"']);
             while (($row = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
                 foreach ($row as $candidate) {
-                    if (is_string($candidate) && $this->normalizer->normalize($candidate) === $needle) {
+                    if (is_string($candidate) && $this->normalizer->identityKey($candidate) === $needle) {
                         return $this->remember($needle, true);
                     }
                 }

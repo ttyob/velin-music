@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\ResourcePlugin;
 
+use app\application\Storage\StorageLayout;
 use stdClass;
 use support\Db;
 use FilesystemIterator;
@@ -14,7 +15,7 @@ use RecursiveIteratorIterator;
  * 为受信 PHP 资源插件分配由 Velin 核心管理的隔离工作目录。
  *
  * 普通运行数据固定进入 `runtime/resource-plugins/{plugin-key}`，可包含音频正文的大文件工作区固定进入
- * `/media/plugins/{plugin-key}`。插件只能通过本服务取得路径，不能把中间文件写进音乐库或自行选择宿主
+ * `/storage/downloads/{plugin-key}`。插件只能通过本服务取得路径，不能把中间文件写进音乐库或自行选择宿主
  * 路径。集合根和插件根都带有核心创建的精确所有权标记；已有但无标记的目录不会被自动接管，符号链接、
  * 路径逃逸和不可写目录均失败关闭。方法按请求幂等，不执行递归删除，也不修改插件数据库。
  */
@@ -55,15 +56,14 @@ final readonly class PhpResourcePluginWorkspaceService
     /**
      * 返回插件专属媒体临时库。
      *
-     * 默认集合根为 `/media/plugins`，部署者可用 `VELIN_PLUGIN_MEDIA_ROOT` 指定同等受控的绝对路径。分配
+     * 默认集合根固定为 `/storage/downloads`，不接受环境变量改成任意路径。分配
      * 前会把集合真实路径与全部本地音乐库真实根做双向包含检查；任一方是另一方自身或子目录时拒绝，
      * 从结构上保证扫描器不会发现 partial、转码副本和任务收据。该方法不保证与最终音乐库位于同设备，
      * 需要原子发布的插件必须在发布前比较 `st_dev` 并在跨设备时失败关闭。
      */
     public function mediaDirectory(string $pluginKey): string
     {
-        $configured = getenv('VELIN_PLUGIN_MEDIA_ROOT');
-        $root = $this->mediaRoot ?? (is_string($configured) && $configured !== '' ? $configured : '/media/plugins');
+        $root = $this->mediaRoot ?? StorageLayout::DOWNLOAD_ROOT;
         $this->assertMediaRootDoesNotOverlapLibraries($root);
         return $this->allocate($root, $pluginKey, 'media');
     }
@@ -76,7 +76,7 @@ final readonly class PhpResourcePluginWorkspaceService
      * 某类目录从未分配时幂等跳过。任一未知所有权、文件系统失败或路径异常会中止卸载，调用方应恢复
      * 隔离中的插件包；已经删除的临时数据可重建，不参与数据库回滚。媒体插件根顶层 `downloads` 是协议
      * 保留的外部交换目录，存在时保留该目录、插件根及其 marker，只清理 `runtime` 等临时内容；最终
-     * 媒体、旧 `/media/downloads` 和保留目录中的做种数据永远不在本方法删除范围内。
+     * 最终媒体和保留目录中的做种数据永远不在本方法删除范围内。
      */
     public function removePluginDirectories(string $pluginKey): void
     {
@@ -86,8 +86,7 @@ final readonly class PhpResourcePluginWorkspaceService
             $pluginKey,
             'runtime',
         );
-        $configured = getenv('VELIN_PLUGIN_MEDIA_ROOT');
-        $mediaRoot = $this->mediaRoot ?? (is_string($configured) && $configured !== '' ? $configured : '/media/plugins');
+        $mediaRoot = $this->mediaRoot ?? StorageLayout::DOWNLOAD_ROOT;
         $this->assertMediaRootDoesNotOverlapLibraries($mediaRoot);
         $this->removeOwnedPluginDirectory($mediaRoot, $pluginKey, 'media', true);
     }

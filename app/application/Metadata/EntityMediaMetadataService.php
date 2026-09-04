@@ -80,9 +80,10 @@ final class EntityMediaMetadataService
     }
 
     /**
-     * 清除指定实体手工值，并按 raw > scraped 来源回退。
+     * 清除指定实体手工值，并按字段级来源规则回退。
      *
-     * `unlock` 明确决定是否解除来源锁；清除不会删除来源事实或历史。任一版本变化会回滚整个命令。
+     * 普通实体字段按 raw > scraped 回退，专辑标题和发行日期按 scraped > raw 回退；`unlock` 明确决定
+     * 是否解除来源锁。清除不会删除来源事实或历史，任一版本变化会回滚整个命令。
      *
      * @param list<array{field:string,version:int,unlock?:bool}> $changes
      */
@@ -101,7 +102,9 @@ final class EntityMediaMetadataService
                 $before = $states[$change['field']] ?? throw new MediaMetadataConflict('实体字段状态不存在。');
                 if ($before['version'] !== $change['version']) throw new MediaMetadataConflict('实体字段版本已变化。');
                 $rawPresent = $this->valuePresent($before['raw'], $change['field']);
-                $source = $rawPresent ? 'raw' : ($before['scraped'] !== null ? 'scraped' : 'raw');
+                $source = $type === 'album' && in_array($change['field'], ['title', 'releaseDate'], true)
+                    && $before['scraped'] !== null
+                    ? 'scraped' : ($rawPresent ? 'raw' : ($before['scraped'] !== null ? 'scraped' : 'raw'));
                 $after = $source === 'scraped' ? $before['scraped'] : $before['raw'];
                 $updated = Db::table($table)->where($idColumn, $entityId)->where('field_key', $change['field'])
                     ->where('version', $change['version'])->update([

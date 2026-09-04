@@ -4,13 +4,15 @@ declare(strict_types=1);
 
 namespace app\application\System;
 
+use app\application\Storage\StorageLayout;
+
 use PDO;
 use Throwable;
 
 /**
  * 提供元数据插件使用的只读艺人辅助 SQLite 与唯一活动上传存储内核。
  *
- * 默认根固定在 `/media/cache/artist-database`，属于已映射的媒体缓存总根，不接受环境变量、客户端路径
+ * 默认根固定在 `/data/cache/artist-database`，属于应用数据根下的可重建缓存，不接受环境变量、客户端路径
  * 或原始文件名作为物理路径。每个分块在进程锁下按服务端记录的连续偏移写入；完成时校验文件头、
  * `quick_check`、必需表列和最低数据量，再以同文件系统 rename 原子替换。任何校验失败都会删除临时
  * 文件并保留旧库，读取状态和匹配查询从不修改业务数据库。该类不再由系统设置 Controller 直接调用，
@@ -32,7 +34,7 @@ final class ArtistDatabaseStorageService
      * 目录创建和权限检查推迟到公开操作，使 Controller 能先完成实时授权。
      */
     public function __construct(
-        private readonly string $root = '/media/cache/artist-database',
+        private readonly string $root = StorageLayout::ARTIST_DATABASE_ROOT,
         private readonly int $minimumArtists = 100_000,
         private readonly int $minimumNames = 100_000,
     ) {

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace app\application\Playlist;
 
 use app\application\Media\MediaQueryService;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use app\infrastructure\Audit\AuditLogger;
 use PDO;
 use stdClass;
@@ -26,6 +28,7 @@ final class PlaylistService
         private readonly MediaQueryService $media = new MediaQueryService(),
         private readonly AuditLogger $auditLogger = new AuditLogger(),
         private readonly SmartPlaylistEvaluator $smartEvaluator = new SmartPlaylistEvaluator(),
+        private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
     ) {
     }
 
@@ -221,6 +224,7 @@ final class PlaylistService
             ]);
             $this->insertItems($playlistId, (string) $actor['id'], $songIds, $songs, $now);
         });
+        $this->publishPlaylistChanged($actor, $playlistId, 'created', ['songCount' => count($songIds), 'version' => 1]);
 
         return $this->detail($actor, $playlistId);
     }
@@ -353,6 +357,13 @@ final class PlaylistService
             throw $throwable;
         }
 
+        if (!$replayed) {
+            $this->publishPlaylistChanged($actor, $playlistId, 'created', [
+                'songCount' => count($songIds),
+                'version' => 1,
+                'imported' => true,
+            ]);
+        }
         return [
             'playlist' => $this->detail($actor, $playlistId),
             'report' => $storedReport,
@@ -372,6 +383,9 @@ final class PlaylistService
                 'updated_at' => gmdate('Y-m-d\TH:i:s\Z'),
             ]);
         });
+        $this->publishPlaylistChanged($actor, $playlistId, 'updated', [
+            'version' => (int) $command['expectedVersion'] + 1,
+        ]);
 
         return $this->detail($actor, $playlistId);
     }
@@ -401,6 +415,10 @@ final class PlaylistService
                 'updated_at' => $now,
             ]);
         });
+        $this->publishPlaylistChanged($actor, $playlistId, 'items_replaced', [
+            'songCount' => count($songIds),
+            'version' => (int) $command['expectedVersion'] + 1,
+        ]);
 
         return $this->detail($actor, $playlistId);
     }
@@ -474,6 +492,9 @@ final class PlaylistService
                 'updated_at' => $now,
             ]);
         });
+        $this->publishPlaylistChanged($actor, $playlistId, 'entry_added', [
+            'version' => (int) $command['expectedVersion'] + 1,
+        ]);
 
         return $this->detail($actor, $playlistId);
     }
@@ -515,6 +536,10 @@ final class PlaylistService
                 ]);
             },
         );
+        $this->publishPlaylistChanged($actor, $playlistId, 'replaced', [
+            'songCount' => count($songIds),
+            'version' => (int) $command['expectedVersion'] + 1,
+        ]);
 
         return $this->detail($actor, $playlistId);
     }
@@ -770,6 +795,27 @@ final class PlaylistService
         $this->mutateHeader($actor, $playlistId, $expectedVersion, static function (stdClass $row): void {
             Db::table('playlists')->where('id', (string) $row->id)->where('version', (int) $row->version)->delete();
         });
+        $this->publishPlaylistChanged($actor, $playlistId, 'deleted', ['version' => $expectedVersion]);
+    }
+
+    /**
+     * 在歌单 SQLite 提交之后发送有限期扩展通知。
+     *
+     * payload 只能包含版本、数量和动作等可重建摘要；歌曲顺序、标题、导入原文和可见性不进入 Redis。
+     * Redis 故障只丢失通知，不能回滚歌单或把已提交版本再次执行。
+     *
+     * @param array<string,mixed> $payload
+     */
+    private function publishPlaylistChanged(array $actor, string $playlistId, string $action, array $payload = []): void
+    {
+        $this->pluginEvents->publish(
+            PluginDomainEvent::PLAYLIST_CHANGED,
+            'playlist',
+            $playlistId,
+            'user',
+            (string) $actor['id'],
+            ['action' => $action] + $payload,
+        );
     }
 
     /**

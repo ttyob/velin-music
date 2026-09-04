@@ -59,11 +59,20 @@ final class LibraryFileDiscovery
      *        ScanExecutionCancelled, after which no reconciliation may run.
      * @return Generator<int, DiscoveredAudioFile|DiscoveredM3uSource, mixed, array{processedEntries: int, ignoredEntries: int, failedEntries: int}>
      */
-    public function files(string $root, string $symlinkPolicy, callable $checkpoint): Generator
+    public function files(
+        string $root,
+        string $symlinkPolicy,
+        callable $checkpoint,
+        ?string $startDirectory = null,
+    ): Generator
     {
         $root = rtrim($root, DIRECTORY_SEPARATOR);
-        $stack = [[$root, $root]];
-        $visitedDirectories = [$root => true];
+        $start = $startDirectory === null ? $root : rtrim($startDirectory, DIRECTORY_SEPARATOR);
+        if (!$this->isWithinRoot($start, $root) || !is_dir($start) || !is_readable($start)) {
+            throw new \UnexpectedValueException('Scoped scan directory is unavailable.');
+        }
+        $stack = [[$start, $start]];
+        $visitedDirectories = [$start => true];
         $visitedFiles = [];
         $processedEntries = 0;
         $ignoredEntries = 0;

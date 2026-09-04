@@ -1,0 +1,388 @@
+#!/bin/sh
+set -eu
+
+# 这是 Docker 部署唯一的宿主启动入口：先原子准备只读挂载给应用的 `.env` 密钥，再检查 Docker、
+# 固定目录、磁盘与端口，最后构建并启动所有服务且等待健康。已有非占位密钥必须保持字节不变，避免
+# 登录摘要和已加密凭据失效；`--compose-init` 是原生 Compose 调用的无 Docker 内部模式，负责同一密钥
+# 和固定目录契约，`--keys-only` 只用于隔离契约测试。认证摘要、凭据加密和 Prometheus 访问分别使用
+# 独立随机值，补齐任一缺失项都不得轮换另外两项；两种内部模式都不是第二套宿主运维入口。
+umask 077
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BACKEND_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+TEMPLATE_FILE="$BACKEND_DIR/.env.docker.example"
+COMPOSE_FILE="$BACKEND_DIR/compose.yaml"
+HOST_DATA_ROOT="$BACKEND_DIR/docker-data"
+HOST_STORAGE_ROOT="$BACKEND_DIR/storage"
+
+fail()
+{
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+usage()
+{
+    printf '%s\n' 'Usage: docker-bootstrap [--compose-init|--keys-only [environment-file]]' >&2
+    exit 2
+}
+
+# 正常启动只支持仓库固定 `.env`，避免检查了一个文件却让容器挂载另一个文件。可选路径开放给内部
+# `--compose-init` 与隔离测试 `--keys-only`；两种模式都不探测 Docker 或启动外部服务，只有前者准备
+# 固定数据布局，后者不会创建挂载目录。
+MODE=bootstrap
+case "${1:-}" in
+    --compose-init)
+        MODE=compose
+        shift
+        ;;
+    --keys-only)
+        MODE=keys
+        shift
+        ;;
+    --help|-h)
+        usage
+        ;;
+esac
+
+if [ "$MODE" = keys ] || [ "$MODE" = compose ]; then
+    [ "$#" -le 1 ] || usage
+    ENV_FILE=${1:-"$BACKEND_DIR/docker-data/config/.env"}
+else
+    [ "$#" -eq 0 ] || usage
+    ENV_FILE="$BACKEND_DIR/docker-data/config/.env"
+fi
+LOCK_DIR="${ENV_FILE}.lock"
+TEMP_FILE=
+
+# host 网络、镜像架构选择和健康等待都依赖 Linux Docker Engine 与 Compose v2。检查只读取宿主状态；
+# Docker daemon 不可访问或 Compose 缺少 `--wait` 时在创建目录、构建镜像和启动容器前失败关闭。
+check_host_environment()
+{
+    [ "$(uname -s)" = Linux ] || fail 'Velin Music host-network deployment requires Linux.'
+    case "$(uname -m)" in
+        x86_64|amd64|aarch64|arm64) ;;
+        *) fail "Unsupported Docker host architecture: $(uname -m)" ;;
+    esac
+    command -v docker >/dev/null 2>&1 || fail 'Docker Engine is not installed or not available in PATH.'
+    docker info >/dev/null 2>&1 || fail 'Docker daemon is unavailable to the current user.'
+    docker compose version >/dev/null 2>&1 || fail 'Docker Compose v2 is required.'
+    docker compose up --help 2>/dev/null | grep -q -- '--wait' \
+        || fail 'Docker Compose must support the up --wait option.'
+}
+
+if [ "$MODE" = bootstrap ]; then
+    check_host_environment
+fi
+
+# 临时文件与锁目录只位于目标 `.env` 同目录。正常完成、错误或信号退出都会尝试清理；目标文件仅在
+# 完整内容写入并 chmod 成功后由同目录 rename 原子替换，所以中途失败不会留下半写配置。
+cleanup()
+{
+    if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
+        rm -f -- "$TEMP_FILE"
+    fi
+    rmdir -- "$LOCK_DIR" 2>/dev/null || true
+}
+
+[ -r "$TEMPLATE_FILE" ] || fail "Docker environment template is missing: $TEMPLATE_FILE"
+[ ! -L "$ENV_FILE" ] || fail "Refusing to replace symlinked Docker environment file: $ENV_FILE"
+if [ -e "$ENV_FILE" ] && [ ! -f "$ENV_FILE" ]; then
+    fail "Docker environment path is not a regular file: $ENV_FILE"
+fi
+# 宿主启动优先使用 OpenSSL；Compose 初始化服务复用最终 PHP 镜像，不为一次随机生成额外安装系统包。
+# 两条路径都由内核 CSPRNG 生成相同长度的十六进制值；若两者均不可用则在写临时文件前失败关闭。
+generate_secret()
+{
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+        return
+    fi
+    if command -v php >/dev/null 2>&1; then
+        php -r 'echo bin2hex(random_bytes(32));'
+        return
+    fi
+    fail 'OpenSSL or PHP is required to generate Docker deployment keys.'
+}
+
+# mkdir 是跨进程的原子互斥边界，防止两个首次启动各自生成密钥并由后完成者静默轮换。异常终止可能
+# 留下锁目录；此时失败关闭，由运维确认没有初始化进程后删除精确的 `.env.lock`，不自动猜测锁是否过期。
+if ! mkdir -m 700 -- "$LOCK_DIR" 2>/dev/null; then
+    fail "Docker environment initialization is already running or stale lock exists: $LOCK_DIR"
+fi
+trap cleanup 0 1 2 15
+
+SOURCE_FILE=$TEMPLATE_FILE
+CREATED=true
+if [ -f "$ENV_FILE" ]; then
+    SOURCE_FILE=$ENV_FILE
+    CREATED=false
+fi
+
+AUTH_COUNT=0
+CREDENTIAL_COUNT=0
+METRICS_COUNT=0
+AUTH_VALUE=
+CREDENTIAL_VALUE=
+METRICS_VALUE=
+OBSOLETE_COUNT=0
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+        VELIN_AUTH_HASH_KEY=*)
+            AUTH_COUNT=$((AUTH_COUNT + 1))
+            AUTH_VALUE=${line#VELIN_AUTH_HASH_KEY=}
+            ;;
+        VELIN_CREDENTIAL_KEY=*)
+            CREDENTIAL_COUNT=$((CREDENTIAL_COUNT + 1))
+            CREDENTIAL_VALUE=${line#VELIN_CREDENTIAL_KEY=}
+            ;;
+        VELIN_METRICS_TOKEN=*)
+            METRICS_COUNT=$((METRICS_COUNT + 1))
+            METRICS_VALUE=${line#VELIN_METRICS_TOKEN=}
+            ;;
+        VELIN_WEB_HOST_PORT=*|VELIN_REDIS_HOST_PORT=*|VELIN_MEDIA_HOST_PATH=*|VELIN_SCRAPE_CACHE_HOST_PATH=*|\
+        VELIN_ALPINE_REPOSITORY=*|VELIN_FFPROBE_DOWNLOAD_PREFIX=*|VELIN_GO_PROXY=*|\
+        VELIN_SESSION_DRIVER=*|VELIN_REDIS_HOST=*|VELIN_REDIS_PORT=*|VELIN_REDIS_DATABASE=*)
+            OBSOLETE_COUNT=$((OBSOLETE_COUNT + 1))
+            ;;
+    esac
+done < "$SOURCE_FILE"
+
+[ "$AUTH_COUNT" -le 1 ] || fail "VELIN_AUTH_HASH_KEY is defined more than once in $SOURCE_FILE"
+[ "$CREDENTIAL_COUNT" -le 1 ] || fail "VELIN_CREDENTIAL_KEY is defined more than once in $SOURCE_FILE"
+[ "$METRICS_COUNT" -le 1 ] || fail "VELIN_METRICS_TOKEN is defined more than once in $SOURCE_FILE"
+
+AUTH_GENERATED=false
+case "$AUTH_VALUE" in
+    ''|'replace-with-a-long-random-production-secret')
+        AUTH_VALUE=$(generate_secret)
+        AUTH_GENERATED=true
+        ;;
+esac
+
+CREDENTIAL_GENERATED=false
+case "$CREDENTIAL_VALUE" in
+    ''|'replace-with-an-independent-long-random-production-secret')
+        CREDENTIAL_VALUE=$(generate_secret)
+        CREDENTIAL_GENERATED=true
+        ;;
+esac
+
+METRICS_GENERATED=false
+case "$METRICS_VALUE" in
+    ''|'replace-with-an-independent-random-metrics-token')
+        METRICS_VALUE=$(generate_secret)
+        METRICS_GENERATED=true
+        ;;
+esac
+
+if [ "$CREATED" = false ] && [ "$AUTH_GENERATED" = false ] && [ "$CREDENTIAL_GENERATED" = false ] \
+    && [ "$METRICS_GENERATED" = false ] \
+    && [ "$OBSOLETE_COUNT" -eq 0 ]; then
+    chmod 600 -- "$ENV_FILE"
+    printf 'Docker deployment keys already exist; kept %s unchanged.\n' "$ENV_FILE" >&2
+else
+    TEMP_FILE=$(mktemp "${ENV_FILE}.tmp.XXXXXX")
+    AUTH_WRITTEN=false
+    CREDENTIAL_WRITTEN=false
+    METRICS_WRITTEN=false
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            VELIN_AUTH_HASH_KEY=*)
+                printf 'VELIN_AUTH_HASH_KEY=%s\n' "$AUTH_VALUE"
+                AUTH_WRITTEN=true
+                ;;
+            VELIN_CREDENTIAL_KEY=*)
+                printf 'VELIN_CREDENTIAL_KEY=%s\n' "$CREDENTIAL_VALUE"
+                CREDENTIAL_WRITTEN=true
+                ;;
+            VELIN_METRICS_TOKEN=*)
+                printf 'VELIN_METRICS_TOKEN=%s\n' "$METRICS_VALUE"
+                METRICS_WRITTEN=true
+                ;;
+            VELIN_WEB_HOST_PORT=*|VELIN_REDIS_HOST_PORT=*|VELIN_MEDIA_HOST_PATH=*|VELIN_SCRAPE_CACHE_HOST_PATH=*|\
+            VELIN_ALPINE_REPOSITORY=*|VELIN_FFPROBE_DOWNLOAD_PREFIX=*|VELIN_GO_PROXY=*|\
+            VELIN_SESSION_DRIVER=*|VELIN_REDIS_HOST=*|VELIN_REDIS_PORT=*|VELIN_REDIS_DATABASE=*)
+                ;;
+            *)
+                printf '%s\n' "$line"
+                ;;
+        esac
+    done < "$SOURCE_FILE" > "$TEMP_FILE"
+
+    if [ "$AUTH_WRITTEN" = false ]; then
+        printf '\nVELIN_AUTH_HASH_KEY=%s\n' "$AUTH_VALUE" >> "$TEMP_FILE"
+    fi
+    if [ "$CREDENTIAL_WRITTEN" = false ]; then
+        printf 'VELIN_CREDENTIAL_KEY=%s\n' "$CREDENTIAL_VALUE" >> "$TEMP_FILE"
+    fi
+    if [ "$METRICS_WRITTEN" = false ]; then
+        printf 'VELIN_METRICS_TOKEN=%s\n' "$METRICS_VALUE" >> "$TEMP_FILE"
+    fi
+
+    chmod 600 -- "$TEMP_FILE"
+    mv -f -- "$TEMP_FILE" "$ENV_FILE"
+    TEMP_FILE=
+
+    if [ "$CREATED" = true ]; then
+        printf 'Created %s with independent Docker deployment keys.\n' "$ENV_FILE" >&2
+    else
+        printf 'Updated %s; existing deployment keys were preserved.\n' "$ENV_FILE" >&2
+    fi
+fi
+
+# 密钥文件完成原子发布后立即释放锁，镜像构建和健康等待不占用初始化互斥边界。此后失败不回滚密钥：
+# 它们已成为稳定部署身份，下次重试必须复用，不能因 Docker 或网络故障生成另一组值。
+cleanup
+trap - 0 1 2 15
+
+if [ "$MODE" = keys ]; then
+    exit 0
+fi
+
+# 原生 Compose 与宿主完整启动必须建立同一双根数据布局。宿主模式检查部署包中的 `docker-data` 与
+# `storage`，容器 compose 模式检查挂载后的 `/data` 与 `/storage`；两者只创建可重建缓存和空目录，绝不
+# 搬运旧 `/media` 数据。升级实例必须由停机迁移先把真实文件原子移动到新根，再启动新镜像，避免容器
+# 在跨挂载边界复制大体积媒体或合并下载现场。符号链接、非目录或不可写路径全部失败关闭；重复启动只
+# 验证既有布局，不重置数据库、插件、下载或音乐文件。
+prepare_data_layout()
+{
+    if [ "$MODE" = compose ] && [ "$BACKEND_DIR" = /app ]; then
+        data_root=/data
+        storage_root=/storage
+    else
+        data_root=$HOST_DATA_ROOT
+        storage_root=$HOST_STORAGE_ROOT
+    fi
+    database_dir="$data_root/database"
+    runtime_dir="$data_root/runtime"
+    plugin_dir="$data_root/plugins"
+    cache_root="$data_root/cache"
+    scrape_cache="$cache_root/scrape"
+    library_root="$storage_root/music"
+    download_root="$storage_root/downloads"
+
+    for persistent_dir in "$data_root" "$storage_root" "$database_dir" "$runtime_dir" "$plugin_dir"; do
+        [ ! -L "$persistent_dir" ] || fail "Refusing symlinked persistent directory: $persistent_dir"
+        [ -d "$persistent_dir" ] || fail "Persistent directory is missing: $persistent_dir"
+        [ -r "$persistent_dir" ] || fail "Persistent directory is not readable: $persistent_dir"
+        [ -w "$persistent_dir" ] || fail "Persistent directory is not writable: $persistent_dir"
+        [ -x "$persistent_dir" ] || fail "Persistent directory is not searchable: $persistent_dir"
+    done
+    if [ "$MODE" != compose ]; then
+        [ -r "$BACKEND_DIR/docker/owntone/owntone.conf" ] \
+            || fail "OwnTone configuration is missing: $BACKEND_DIR/docker/owntone/owntone.conf"
+    fi
+    for managed_path in "$cache_root" "$scrape_cache" "$library_root" "$download_root"; do
+        [ ! -L "$managed_path" ] || fail "Refusing symlinked managed directory: $managed_path"
+        if [ -e "$managed_path" ] && [ ! -d "$managed_path" ]; then
+            fail "Managed directory is not a directory: $managed_path"
+        fi
+    done
+    mkdir -p -- "$scrape_cache" "$library_root" "$download_root"
+
+    DATA_REAL=$(CDPATH= cd -- "$data_root" && pwd -P)
+    STORAGE_REAL=$(CDPATH= cd -- "$storage_root" && pwd -P)
+    DATABASE_REAL=$(CDPATH= cd -- "$database_dir" && pwd -P)
+    LIBRARY_REAL=$(CDPATH= cd -- "$library_root" && pwd -P)
+    DOWNLOAD_REAL=$(CDPATH= cd -- "$download_root" && pwd -P)
+    SCRAPE_CACHE_REAL=$(CDPATH= cd -- "$scrape_cache" && pwd -P)
+    [ -r "$STORAGE_REAL" ] || fail "Storage directory is not readable: $STORAGE_REAL"
+    [ -x "$STORAGE_REAL" ] || fail "Storage directory is not searchable: $STORAGE_REAL"
+    [ -w "$DOWNLOAD_REAL" ] || fail "Download directory is not writable: $DOWNLOAD_REAL"
+    [ -w "$SCRAPE_CACHE_REAL" ] || fail "Scrape cache directory is not writable: $SCRAPE_CACHE_REAL"
+    [ -x "$SCRAPE_CACHE_REAL" ] || fail "Scrape cache directory is not searchable: $SCRAPE_CACHE_REAL"
+    case "${LIBRARY_REAL}/" in
+        "${SCRAPE_CACHE_REAL}/"*) fail 'Default library and scrape cache directories must not overlap.' ;;
+    esac
+    case "${SCRAPE_CACHE_REAL}/" in
+        "${LIBRARY_REAL}/"*) fail 'Default library and scrape cache directories must not overlap.' ;;
+    esac
+    [ "$(stat -c %d "$LIBRARY_REAL")" = "$(stat -c %d "$DOWNLOAD_REAL")" ] \
+        || fail 'Music library and plugin downloads must use the same filesystem for hard-link publication.'
+    [ "$(stat -c %d "$DATABASE_REAL")" = "$(stat -c %d "$DATA_REAL")" ] \
+        || fail 'Database directory must remain inside the application data filesystem.'
+}
+
+prepare_data_layout
+if [ "$MODE" = compose ]; then
+    exit 0
+fi
+
+# 部署必须为 SQLite、可重建缓存和 Docker 镜像层保留最小余量。检查以 KiB 为单位读取目标文件系统，
+# 不清理任何镜像、卷或业务文件；空间不足时由运维明确扩容或执行受控清理后重试。
+assert_available_space()
+{
+    path=$1
+    minimum_kib=$2
+    label=$3
+    available_kib=$(df -Pk -- "$path" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    case "$available_kib" in
+        ''|*[!0-9]*) fail "Unable to determine free space for $label: $path" ;;
+    esac
+    [ "$available_kib" -ge "$minimum_kib" ] \
+        || fail "$label requires at least ${minimum_kib} KiB free; available ${available_kib} KiB."
+}
+
+# host 网络没有 Docker 端口发布层，必须在启动前检查真实宿主监听。当前 velin-music 对应服务已运行时
+# 允许继续占用自己的端口，使 up/restart 保持幂等；没有对应运行容器的监听一律视为外部冲突。
+project_service_is_running()
+{
+    service=$1
+    container_id=$(docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" ps -q "$service" 2>/dev/null \
+        | awk 'NR == 1 { print; exit }')
+    [ -n "$container_id" ] || return 1
+    [ "$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null)" = true ]
+}
+
+port_is_listening()
+{
+    port=$1
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltn 2>/dev/null | awk -v expected="$port" '
+            { address = $4; sub(/^.*:/, "", address); if (address == expected) found = 1 }
+            END { exit found ? 0 : 1 }
+        '
+        return
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk -v expected="$port" '
+            NR > 2 { address = $4; sub(/^.*:/, "", address); if (address == expected) found = 1 }
+            END { exit found ? 0 : 1 }
+        '
+        return
+    fi
+    fail 'Port preflight requires ss or netstat on the Docker host.'
+}
+
+assert_port_available_or_owned()
+{
+    port=$1
+    service=$2
+    if ! port_is_listening "$port"; then
+        return
+    fi
+    if project_service_is_running "$service"; then
+        printf 'Port %s is already owned by running Velin service %s.\n' "$port" "$service" >&2
+        return
+    fi
+    fail "Host port $port required by $service is already in use by another process."
+}
+
+DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+[ -d "$DOCKER_ROOT" ] || fail "Docker root directory is unavailable: $DOCKER_ROOT"
+assert_available_space "$DATABASE_REAL" 524288 'Database filesystem'
+assert_available_space "$SCRAPE_CACHE_REAL" 1048576 'Scrape cache filesystem'
+assert_available_space "$DOCKER_ROOT" 4194304 'Docker filesystem'
+
+docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" config --quiet
+assert_port_available_or_owned 8787 backend
+assert_port_available_or_owned 16379 redis
+assert_port_available_or_owned 3689 owntone
+printf 'Docker host, disk, port and mount preflight passed.\n' >&2
+
+# `--wait` 只在 backend、Redis 与 OwnTone 都达到 Compose 定义的 healthy 状态后成功。构建或启动失败
+# 保留 SQLite、媒体目录、命名卷和已生成密钥，运维修复环境后可幂等重试；脚本不执行 down、删除或回滚。
+docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" \
+    up -d --build --wait --wait-timeout 180
+docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" ps

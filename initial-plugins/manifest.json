@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    {
+      "key": "metadata-scrape",
+      "archive": "metadata-scrape-0.0.10.zip"
+    }
+  ]
+}

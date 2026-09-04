@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace app\application\Lyrics;
 
+use app\application\Storage\StorageLayout;
+
 use app\application\Metadata\ScrapeAssetFilePublisher;
 use app\application\Metadata\ScrapeAssetPublicationFailed;
 use stdClass;
@@ -25,6 +27,7 @@ final readonly class LyricsFileStore
     public function __construct(
         private LyricsParser $parser = new LyricsParser(),
         private ScrapeAssetFilePublisher $publisher = new ScrapeAssetFilePublisher(),
+        private string $managedCacheRoot = StorageLayout::SCRAPE_CACHE_ROOT,
     ) {}
 
     /**
@@ -168,10 +171,15 @@ final readonly class LyricsFileStore
         return $bytes;
     }
 
-    /** 返回固定缓存根；根必须真实、非链接、可写，且路径不能由请求或数据库覆盖。 */
+    /**
+     * 返回受信构造边界指定的缓存根；生产默认固定为 `/data/cache/scrape`。
+     *
+     * 可选构造参数只用于单元测试注入独立临时目录，Controller、请求、环境变量和数据库均不能覆盖它。
+     * 每次读写仍重新验证真实路径、目录类型、符号链接和写权限；根无效时失败关闭且不创建任何文件。
+     */
     private function cacheRoot(): string
     {
-        $configured = rtrim((string) (getenv('VELIN_SCRAPE_CACHE_PATH') ?: '/media/cache/scrape'), DIRECTORY_SEPARATOR);
+        $configured = rtrim($this->managedCacheRoot, DIRECTORY_SEPARATOR);
         $root = realpath($configured);
         if ($root === false || $root !== $configured || is_link($configured) || !is_dir($root) || !is_writable($root)) {
             throw new LyricsFileUnavailable('LYRICS_CACHE_ROOT_UNAVAILABLE');

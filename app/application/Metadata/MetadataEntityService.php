@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\Metadata;
 
+use app\application\Artist\ArtistNameIdentityNormalizer;
 use app\application\Media\AlbumEditionNameNormalizer;
 use app\application\Search\SearchTextNormalizer;
 use app\infrastructure\Audit\AuditLogger;
@@ -34,6 +35,7 @@ final readonly class MetadataEntityService
         private SearchTextNormalizer $normalizer = new SearchTextNormalizer(),
         private EntityMetadataStateRepository $entityStates = new EntityMetadataStateRepository(),
         private AlbumEditionNameNormalizer $albumEditions = new AlbumEditionNameNormalizer(),
+        private ArtistNameIdentityNormalizer $artistNames = new ArtistNameIdentityNormalizer(),
     )
     {
     }
@@ -650,7 +652,7 @@ final readonly class MetadataEntityService
     private function splitArtist(stdClass $source, string $createdId, array $songIds, string $name, string $now): void
     {
         Db::table('media_artists')->insert([
-            'id' => $createdId, 'name' => $name, 'normalized_name' => $this->normalizer->normalize($name),
+            'id' => $createdId, 'name' => $name, 'normalized_name' => $this->artistNames->storageKey($name),
             'sort_name' => null, 'musicbrainz_artist_id' => null, 'created_at' => $now, 'updated_at' => $now,
         ]);
         Db::table('media_song_artists')->where('artist_id', (string) $source->id)->whereIn('song_id', $songIds)
@@ -743,10 +745,9 @@ final readonly class MetadataEntityService
         if (count($selectedIds) >= count($all) || array_diff($selectedIds, $all) !== []) {
             throw new MetadataEntityConflict('只能拆分来源实体中的部分歌曲，来源至少保留一首。');
         }
-        $normalized = $this->normalizer->normalize(trim($newName));
         // 专辑允许同名发行版；其 identity_key 仍使用独立的手工拆分键。艺术家词汇则必须保持全局唯一。
         $collision = $type === 'artist'
-            && Db::table('media_artists')->where('normalized_name', $normalized)->exists();
+            && Db::table('media_artists')->whereIn('normalized_name', $this->artistNames->lookupKeys($newName))->exists();
         if ($collision) throw new MetadataEntityConflict('同名艺术家或专辑已经存在，请改用合并或更换名称。');
 
         return [$source, $selectedIds];

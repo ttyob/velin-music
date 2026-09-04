@@ -27,6 +27,33 @@ final readonly class GoogleDriveClientFactory
 
     public function forLibrary(string $libraryId): GoogleDriveClient
     {
+        return $this->buildLibraryClient($libraryId, null, false);
+    }
+
+    /**
+     * 使用库中已有 OAuth 授权、但以调用方提供的代理建立 Google Drive 客户端。
+     *
+     * 该入口只用于代理变更尚未提交时的连接预检：客户端密钥、refresh token、Drive 和根仍来自受保护
+     * 连接表，只有网络出口由参数覆盖。代理参数必须已经由 NetworkProxyProfileService 校验，方法不会
+     * 写数据库，也不会把秘密放入响应或审计。
+     *
+     * @param array{scheme:string,host:string,port:int,username:string,password:string}|null $proxy
+     */
+    public function forLibraryUsingProxy(string $libraryId, ?array $proxy): GoogleDriveClient
+    {
+        return $this->buildLibraryClient($libraryId, $proxy, true);
+    }
+
+    /**
+     * 从受保护连接表读取授权事实并构造客户端。
+     *
+     * `$overrideProxy` 用于区分“使用库当前代理”和“明确使用 null 表示直连”，否则关闭代理时无法安全
+     * 覆盖旧值。读取、解密和客户端构造失败均转换为稳定授权错误；客户端只在当前任务生命周期内存在。
+     *
+     * @param array{scheme:string,host:string,port:int,username:string,password:string}|null $proxy
+     */
+    private function buildLibraryClient(string $libraryId, ?array $proxy, bool $overrideProxy): GoogleDriveClient
+    {
         /** @var stdClass|null $row */
         $row = Db::table('google_drive_library_connections as connection')
             ->join('music_libraries as library', 'library.id', '=', 'connection.library_id')
@@ -45,14 +72,15 @@ final readonly class GoogleDriveClientFactory
         } catch (Throwable) {
             throw new GoogleDriveUnavailable('GOOGLE_DRIVE_REAUTHORIZATION_REQUIRED', 'Google Drive 授权不可用，请重新授权。');
         }
+        $effectiveProxy = $overrideProxy ? $proxy : ($row->proxy_profile_id === null ? null
+            : (new NetworkProxyProfileService())->connection((string) $row->proxy_profile_id));
         return $this->forConfiguration(
             (string) $row->client_id,
             $clientSecret,
             $refreshToken,
             (string) $row->drive_id,
             (string) $row->remote_root_path,
-            proxy: $row->proxy_profile_id === null ? null
-                : (new NetworkProxyProfileService())->connection((string) $row->proxy_profile_id),
+            proxy: $effectiveProxy,
         );
     }
 

@@ -7,8 +7,10 @@ namespace app\application\Metadata;
 use Closure;
 use app\application\Artist\ArtistProfileScrapeJobService;
 use app\application\Artwork\ArtworkCandidateImageNormalizer;
+use app\application\Artwork\ArtworkBlobStore;
 use app\application\Artwork\ArtworkProviderAttribution;
 use app\application\Artwork\ArtworkRemoteImageFetcher;
+use app\application\Artwork\ArtworkCurrentStateService;
 use app\application\Auth\CapabilityResolver;
 use app\application\Library\LibraryAccessResolver;
 use app\application\Lyrics\LyricsFileStore;
@@ -22,6 +24,8 @@ use app\application\Scrape\MetadataEnrichmentResult;
 use app\application\Scrape\ScrapeGeneratedLyrics;
 use app\application\Scrape\ScrapeGeneratedArtwork;
 use app\application\Scrape\ScrapeMetadataCandidate;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use app\infrastructure\Audit\AuditLogger;
 use app\infrastructure\Database\SqliteTransientRetry;
 use app\infrastructure\Database\SqliteWriteGate;
@@ -72,6 +76,10 @@ final class MetadataSyncScrapeWorkerService
         private readonly SqliteTransientRetry $sqliteRetry = new SqliteTransientRetry(),
         private readonly SqliteWriteGate $sqliteWriteGate = new SqliteWriteGate(),
         private readonly MetadataEntityScrapeIntentService $entityIntents = new MetadataEntityScrapeIntentService(),
+        private readonly MetadataScrapePolicyService $scrapePolicy = new MetadataScrapePolicyService(),
+        private readonly ArtworkCurrentStateService $currentArtwork = new ArtworkCurrentStateService(),
+        private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
+        private readonly ArtworkBlobStore $artworkBlobs = new ArtworkBlobStore(),
     ) {}
 
     /**
@@ -564,6 +572,14 @@ final class MetadataSyncScrapeWorkerService
                 ]);
             if (!$this->supportsUnifiedPipeline()) $this->synchronizeJob((string) $target->job_id, $now);
         });
+        if (!$this->supportsUnifiedPipeline()) {
+            $this->publishScrapeCompleted($target, 'succeeded', null, [
+                'source' => $candidate->source,
+                'score' => $candidate->confidence,
+                'lyricsSaved' => $preparedLyrics !== null,
+                'artworkStatus' => $artwork['status'],
+            ]);
+        }
     }
 
     /**
@@ -601,6 +617,9 @@ final class MetadataSyncScrapeWorkerService
                 ]);
             if (!$this->supportsUnifiedPipeline()) $this->synchronizeJob((string) $target->job_id, $now);
         });
+        if (!$this->supportsUnifiedPipeline()) {
+            $this->publishScrapeCompleted($target, 'succeeded', null, ['providerSkipped' => true]);
+        }
     }
 
     /**
@@ -779,11 +798,19 @@ final class MetadataSyncScrapeWorkerService
         }
         $candidateId = $existing instanceof stdClass ? (string) $existing->id : (string) new Ulid();
         if (!$existing instanceof stdClass) {
+            $bytes = (string) $artwork['bytes'];
+            $candidateBytes = $this->artworkBlobs->put(
+                $bytes,
+                'image/webp',
+                ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
+                ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
+                (string) $artwork['contentSha256'],
+            );
             Db::table('media_manual_artwork_candidates')->insert([
                 'id' => $candidateId, 'song_id' => (string) $target->song_id,
                 'album_id' => null, 'artist_id' => null, 'library_id' => (string) $target->library_id,
                 'created_by' => (string) $target->requested_by, 'mime_type' => 'image/webp',
-                'image_bytes' => (string) $artwork['bytes'], 'byte_size' => strlen((string) $artwork['bytes']),
+                'image_bytes' => $candidateBytes, 'byte_size' => strlen($bytes),
                 'width' => ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
                 'height' => ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
                 'content_sha256' => (string) $artwork['contentSha256'],
@@ -798,7 +825,10 @@ final class MetadataSyncScrapeWorkerService
         $selection = Db::table('media_artwork_selection_overrides')->where('song_id', (string) $target->song_id)
             ->where('library_id', (string) $target->library_id)->first(['candidate_id']);
         $status = 'preserved';
-        if (!$selection instanceof stdClass) {
+        $canSelect = $this->canSelectProviderSongArtwork(
+            (string) $target->song_id, (string) $target->library_id, $selection,
+        );
+        if (!$selection instanceof stdClass && $canSelect) {
             Db::table('media_artwork_selection_overrides')->insert([
                 'id' => (string) new Ulid(), 'song_id' => (string) $target->song_id,
                 'album_id' => null, 'artist_id' => null, 'library_id' => (string) $target->library_id,
@@ -806,7 +836,16 @@ final class MetadataSyncScrapeWorkerService
                 'created_at' => $now, 'updated_at' => $now,
             ]);
             $status = 'selected';
-        } elseif (hash_equals((string) $selection->candidate_id, $candidateId)) {
+        } elseif ($selection instanceof stdClass && $canSelect
+            && !hash_equals((string) $selection->candidate_id, $candidateId)) {
+            Db::table('media_artwork_selection_overrides')->where('song_id', (string) $target->song_id)
+                ->where('library_id', (string) $target->library_id)->update([
+                    'candidate_id' => $candidateId, 'version' => Db::raw('version + 1'),
+                    'updated_by' => (string) $target->requested_by, 'updated_at' => $now,
+                ]);
+            $status = 'selected';
+        } elseif ($selection instanceof stdClass
+            && hash_equals((string) $selection->candidate_id, $candidateId)) {
             $status = 'selected';
         }
         $this->audit->record((string) $target->requested_by, 'metadata.sync_scrape.artwork.import',
@@ -854,12 +893,31 @@ final class MetadataSyncScrapeWorkerService
             'storage_locator' => $file['storageLocator'], 'language' => 'und',
             'lyric_kind' => $file['parsed']->kind, 'source_format' => 'lrc',
             'content_sha256' => $file['contentSha256'],
-            'priority' => 400, 'match_score' => max(0, min(100, $score)) / 100,
+            'priority' => $this->scrapePolicy->providerOverridesMetadata('lyrics') ? 600 : 50,
+            'match_score' => max(0, min(100, $score)) / 100,
             'license_policy' => 'cache_allowed', 'source_size_bytes' => $file['sourceSizeBytes'],
             'source_modified_at' => $file['sourceModifiedAt'], 'version' => 1,
             'created_at' => $now, 'updated_at' => $now,
         ]);
         return $lyricId;
+    }
+
+    /**
+     * 判断第三方歌曲封面能否成为当前选择。
+     *
+     * 手工上传/选择永远不可被自动任务替换。没有显式选择时，歌曲继承的本地专辑图也属于文件元数据；
+     * 只有配置为三方优先才允许新增覆盖。已有 Provider 选择可在三方优先时更新，文件优先时保持原状。
+     * 方法只读取来源类别，不暴露图片内容或路径。
+     */
+    private function canSelectProviderSongArtwork(string $songId, string $libraryId, ?stdClass $selection): bool
+    {
+        if ($selection instanceof stdClass) {
+            $origin = Db::table('media_manual_artwork_candidates')->where('id', (string) $selection->candidate_id)
+                ->value('origin_kind');
+            return $origin === 'provider' && $this->scrapePolicy->providerOverridesMetadata('songArtwork');
+        }
+        if (!$this->currentArtwork->exists('song', $songId, $libraryId)) return true;
+        return $this->scrapePolicy->providerOverridesMetadata('songArtwork');
     }
 
     /**
@@ -947,7 +1005,7 @@ final class MetadataSyncScrapeWorkerService
      */
     private function completeResourceStage(stdClass $target, array $summary): void
     {
-        $this->writeTransaction(function () use ($summary, $target): void {
+        $completed = $this->writeTransaction(function () use ($summary, $target): bool {
             $now = gmdate('Y-m-d\TH:i:s\Z');
             $changed = Db::table('metadata_sync_scrape_targets')->where('id', (string) $target->id)
                 ->where('status', 'running')->where('worker_id', (string) $target->worker_id)->update([
@@ -956,7 +1014,7 @@ final class MetadataSyncScrapeWorkerService
                     'worker_id' => null, 'heartbeat_at' => null, 'error_code' => null,
                     'finished_at' => $now, 'updated_at' => $now,
                 ]);
-            if ($changed !== 1) return;
+            if ($changed !== 1) return false;
             $this->audit->record((string) $target->requested_by, 'metadata.sync_scrape.target.complete',
                 'song', (string) $target->song_id, 'success', (string) $target->request_id, [
                     'jobId' => (string) $target->job_id,
@@ -966,7 +1024,15 @@ final class MetadataSyncScrapeWorkerService
                     'resourceCoordinatorErrorCode' => $summary['coordinatorErrorCode'] ?? null,
                 ]);
             $this->synchronizeJob((string) $target->job_id, $now);
+            return true;
         });
+        if ($completed) {
+            $this->publishScrapeCompleted($target, 'succeeded', null, [
+                'relatedArtworkCount' => count($summary['relatedArtwork'] ?? []),
+                'assetPublicationCount' => count($summary['assetPublications'] ?? []),
+                'resourceCoordinatorErrorCode' => $summary['coordinatorErrorCode'] ?? null,
+            ]);
+        }
     }
 
     /** 无可靠候选是正常终态，不把本地目录值伪装成第三方匹配。 */
@@ -990,6 +1056,7 @@ final class MetadataSyncScrapeWorkerService
             $this->queueRelatedEntityMetadata($target, $now);
             $this->synchronizeJob((string) $target->job_id, $now);
         });
+        $this->publishScrapeCompleted($target, 'unmatched');
     }
 
     /** @param list<MetadataProviderResult> $channels */
@@ -1056,6 +1123,9 @@ final class MetadataSyncScrapeWorkerService
                 $this->synchronizeJob((string) $target->job_id, $now);
             }
         });
+        if (!$retry) {
+            $this->publishScrapeCompleted($target, 'failed', 'METADATA_SYNC_PROVIDER_UNAVAILABLE');
+        }
         return !$retry;
     }
 
@@ -1116,6 +1186,37 @@ final class MetadataSyncScrapeWorkerService
             if ($changed !== 1) throw new MediaMetadataConflict('失败任务租约已经变化。');
             $this->synchronizeJob((string) $target->job_id, $now);
         });
+        $this->publishScrapeCompleted($target, 'failed', $errorCode);
+    }
+
+    /**
+     * 在逐曲目标终态事务提交后发布有限期插件通知。
+     *
+     * 事件只包含核心任务、音乐库、终态和可选计数摘要，不包含候选、歌词、图片、渠道原始响应或文件证据。
+     * Redis 故障允许丢失通知；任务终态已经由 SQLite 持久化，不能在这里重试或回滚刮削。
+     *
+     * @param array<string,mixed> $details
+     */
+    private function publishScrapeCompleted(
+        stdClass $target,
+        string $status,
+        ?string $errorCode = null,
+        array $details = [],
+    ): void {
+        $this->pluginEvents->publish(
+            PluginDomainEvent::METADATA_SCRAPE_COMPLETED,
+            'metadata_scrape_target',
+            (string) $target->id,
+            'user',
+            (string) $target->requested_by,
+            [
+                'jobId' => (string) $target->job_id,
+                'libraryId' => (string) $target->library_id,
+                'songId' => (string) $target->song_id,
+                'status' => $status,
+                'errorCode' => $errorCode,
+            ] + $details,
+        );
     }
 
     /** 只从目标终态重建父计数，避免进程退出或重复执行造成自增漂移。 */

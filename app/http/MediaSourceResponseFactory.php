@@ -8,13 +8,18 @@ use app\application\Media\PlayableMedia;
 use support\Response;
 
 /**
- * 为统一媒体读取源选择本地 Workerman 文件响应或远端 Range supervisor。
+ * 为统一媒体读取源选择本地 Go/Workerman 文件响应或远端 Range supervisor。
  *
- * 本地文件继续使用框架 `withFile` 的零拷贝/背压路径；WebDAV 不创建临时文件，改为内部响应标记。两种
- * 分支共享相同状态、长度、Content-Range 和业务响应头，调用方无需知道远端 URL 或凭据。
+ * 本地 Web/App/Subsonic 文件优先生成内置 Go 网关描述；网关关闭、文件位于裸机允许根外或 DLNA 仍需
+ * Workerman socket 进度观察时使用 `withFile`。WebDAV 不创建临时文件，改为内部响应标记。各分支共享
+ * 相同状态、范围和业务响应头，调用方无需知道本地路径、远端 URL 或凭据。
  */
 final readonly class MediaSourceResponseFactory
 {
+    public function __construct(private LocalFileResponseFactory $localFiles = new LocalFileResponseFactory())
+    {
+    }
+
     /**
      * 创建完整或单区间响应。
      *
@@ -37,10 +42,15 @@ final readonly class MediaSourceResponseFactory
         }
         $path = $media->source->localPath();
         if ($path !== null) {
-            $response = response('', $status, $headers);
-            return $status === 200 && $offset === 0 && $length === $media->fileSize
-                ? $response->withFile($path)
-                : $response->withFile($path, $offset, $length);
+            // DLNA 原始直放仍由 Workerman 观察实际 socket 写入量；迁移进度统计前不能让 Go 提前接管正文。
+            return $this->localFiles->create(
+                $path,
+                $status,
+                $headers,
+                $offset,
+                $length,
+                accelerate: $deliveryTicketId === null,
+            );
         }
         if ($status === 206) $headers['Content-Range'] = 'bytes ' . $offset . '-' . ($offset + $length - 1) . '/' . $media->fileSize;
         $headers['Content-Length'] = (string) $length;

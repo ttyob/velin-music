@@ -24,6 +24,7 @@ final class MetadataSyncScrapeService
         private readonly LibraryAccessResolver $libraryAccess = new LibraryAccessResolver(),
         private readonly SongScrapeRelatedArtworkService $relatedArtwork = new SongScrapeRelatedArtworkService(),
         private readonly SongMetadataScrapePolicy $songScrapePolicy = new SongMetadataScrapePolicy(),
+        private readonly MetadataFieldStateRepository $fieldStates = new MetadataFieldStateRepository(),
     ) {}
 
     /**
@@ -163,6 +164,123 @@ final class MetadataSyncScrapeService
         if (preg_match('/^[0-9A-HJKMNP-TV-Z]{26}$/', $jobId) !== 1) throw new MediaMetadataInvalid('任务标识无效。');
         $this->requireRunScrape($actor);
         return $this->project($jobId, $actor);
+    }
+
+    /**
+     * 从一条已成功历史 target 中应用管理员明确选择的插件字段。
+     *
+     * 浏览器只能提交候选字段名和当前字段版本，实际值始终从该 target 的 `metadata-scrape` 安全候选快照
+     * 读取。方法复验任务发起者、`run_scrape`、实时音乐库 manage grant、歌曲仍属于原库、目标终态、
+     * 插件候选可靠分数及逐字段 evidence；任何一项变化都会在写入前失败。字段应用、来源锁和审计处于
+     * 同一 SQLite 短事务，失败整体回滚，不访问平台、不写音频标签或歌词封面文件。
+     *
+     * 外部 ID 候选会合并成一个 `externalIds` 状态，因此其多个候选字段共用一个期望版本；普通字段一一
+     * 对应。重复提交已经锁定且值相同的选择返回当前任务投影，不重复改变字段版本。
+     *
+     * @param array<string,mixed> $actor 当前认证身份
+     * @param mixed $fields 原始候选字段名列表
+     * @param mixed $expectedVersions 原始歌曲状态字段到版本映射
+     * @return array<string,mixed>
+     */
+    public function applyStoredCandidateFields(
+        array $actor,
+        string $targetId,
+        mixed $fields,
+        mixed $expectedVersions,
+        string $requestId,
+    ): array {
+        $this->requireRunScrape($actor);
+        if (preg_match('/^[0-9A-HJKMNP-TV-Z]{26}$/', $targetId) !== 1
+            || !is_array($fields) || !array_is_list($fields) || $fields === []
+            || !is_array($expectedVersions) || ($expectedVersions !== [] && array_is_list($expectedVersions))) {
+            throw new MediaMetadataInvalid('历史刮削字段应用结构无效。');
+        }
+        $normalizedFields = [];
+        foreach ($fields as $field) {
+            if (!is_string($field) || !isset(MetadataSyncScrapeSelection::METADATA_FIELDS[$field])
+                || isset($normalizedFields[$field])) {
+                throw new MediaMetadataInvalid('历史刮削字段无效或重复。');
+            }
+            $normalizedFields[$field] = true;
+        }
+        if (count($normalizedFields) > count(MetadataSyncScrapeSelection::METADATA_FIELDS)) {
+            throw new MediaMetadataInvalid('历史刮削字段数量无效。');
+        }
+
+        return Db::transaction(function () use (
+            $actor, $targetId, $normalizedFields, $expectedVersions, $requestId,
+        ): array {
+            /** @var stdClass|null $target */
+            $target = Db::table('metadata_sync_scrape_targets as targets')
+                ->join('metadata_sync_scrape_jobs as jobs', 'jobs.id', '=', 'targets.job_id')
+                ->where('targets.id', $targetId)->where('jobs.requested_by', (string) $actor['id'])
+                ->first([
+                    'targets.id', 'targets.job_id', 'targets.song_id', 'targets.library_id',
+                    'targets.status', 'targets.selected_source', 'jobs.requested_by',
+                ]);
+            if (!$target instanceof stdClass || $target->song_id === null) {
+                throw new MediaMetadataNotFound('历史刮削目标不存在。');
+            }
+            if ((string) $target->status !== 'succeeded'
+                || (string) $target->selected_source !== 'metadata-scrape') {
+                throw new MediaMetadataConflict('历史刮削目标没有可应用的插件终态。');
+            }
+            $manageable = $this->manageableLibraryIds($actor);
+            if (!isset($manageable[(string) $target->library_id])) {
+                throw new AuthorizationDenied('音乐库授权已变化。');
+            }
+            $songLibrary = Db::table('media_songs')->where('id', (string) $target->song_id)->value('library_id');
+            if (!is_string($songLibrary) || !hash_equals((string) $target->library_id, $songLibrary)) {
+                throw new MediaMetadataConflict('歌曲与历史目标的音乐库身份已经变化。');
+            }
+            /** @var stdClass|null $channel */
+            $channel = Db::table('metadata_sync_scrape_channel_results')
+                ->where('target_id', $targetId)->where('channel_key', 'metadata-scrape')
+                ->where('status', 'matched')->whereNotNull('candidate_json')->first();
+            if (!$channel instanceof stdClass) throw new MediaMetadataConflict('历史插件候选不可用。');
+            $candidate = ScrapeMetadataCandidate::fromJson((string) $channel->candidate_json);
+            if ($candidate->source !== 'metadata-scrape' || $candidate->confidence < 85) {
+                throw new MediaMetadataConflict('历史插件候选不再满足可靠性要求。');
+            }
+
+            $candidateValues = [];
+            $stateFields = [];
+            foreach (array_keys($normalizedFields) as $field) {
+                if (!MetadataSyncScrapeSelection::candidateProvides($candidate, $field)) {
+                    throw new MediaMetadataInvalid('历史插件候选没有提供所选字段。');
+                }
+                $candidateValues[$field] = $candidate->metadata[$field];
+                $stateFields[$this->songStateField($field)] = true;
+            }
+            $stateKeys = array_keys($stateFields);
+            $expectedKeys = array_keys($expectedVersions);
+            sort($stateKeys);
+            sort($expectedKeys);
+            if ($stateKeys !== $expectedKeys) {
+                throw new MediaMetadataInvalid('历史刮削字段版本不完整。');
+            }
+            foreach ($expectedVersions as $field => $version) {
+                if (!isset($stateFields[$field]) || !is_int($version) || $version < 1) {
+                    throw new MediaMetadataInvalid('历史刮削字段版本无效。');
+                }
+            }
+            $this->fieldStates->selectStoredScrapedCandidate(
+                (string) $target->song_id,
+                $candidateValues,
+                $expectedVersions,
+                gmdate('Y-m-d\TH:i:s\Z'),
+            );
+            $this->audit->record(
+                (string) $actor['id'],
+                'metadata.sync_scrape.stored_candidate_apply',
+                'metadata_sync_scrape_target',
+                $targetId,
+                'success',
+                $requestId,
+                ['fields' => array_keys($normalizedFields), 'fieldCount' => count($normalizedFields)],
+            );
+            return $this->project((string) $target->job_id, $actor);
+        });
     }
 
     /**
@@ -436,6 +554,7 @@ final class MetadataSyncScrapeService
                     $selection = null;
                 }
                 return [
+                    'targetId' => (string) $target->id,
                     'songId' => $target->song_id === null ? $facts['songId'] : (string) $target->song_id,
                     'libraryId' => (string) $target->library_id,
                     'title' => $facts['title'],
@@ -612,9 +731,10 @@ final class MetadataSyncScrapeService
      * 读取一个歌曲或共享实体的有效字段，并只把有效来源为 scraped 的值交给插件弹窗。
      *
      * 表和主键列来自固定调用方白名单，不接受浏览器输入；字段 JSON 损坏或字段表尚未迁移时跳过该项。
-     * 返回值不包含数据库 locator、更新时间或锁信息，避免详情页把内部存储事实误当成业务数据。
+     * 返回值不包含数据库 locator 或更新时间；只补充字段锁和版本供“使用数据”的 CAS 与状态展示，
+     * 避免详情页把内部存储事实误当成业务数据。
      *
-     * @return array{fields:list<array{field:string,value:mixed,source:string}>,plugin:array<string,mixed>}
+     * @return array{fields:list<array{field:string,value:mixed,source:string,locked:bool,version:int}>,plugin:array<string,mixed>}
      */
     private function projectPersistedFieldStates(string $table, string $idColumn, string $entityId): array
     {
@@ -622,7 +742,7 @@ final class MetadataSyncScrapeService
         if (!$schema->hasTable($table)) return ['fields' => [], 'plugin' => []];
         /** @var list<stdClass> $states */
         $states = Db::table($table)->where($idColumn, $entityId)->orderBy('field_key')->get([
-            'field_key', 'effective_value_json', 'effective_source', 'scraped_value_json',
+            'field_key', 'effective_value_json', 'effective_source', 'scraped_value_json', 'is_locked', 'version',
         ])->all();
         $fields = [];
         $plugin = [];
@@ -638,7 +758,13 @@ final class MetadataSyncScrapeService
             $source = in_array((string) $state->effective_source, ['raw', 'scraped', 'manual'], true)
                 ? (string) $state->effective_source : 'raw';
             $field = (string) $state->field_key;
-            $fields[] = ['field' => $field, 'value' => $value, 'source' => $source];
+            $fields[] = [
+                'field' => $field,
+                'value' => $value,
+                'source' => $source,
+                'locked' => (int) $state->is_locked === 1,
+                'version' => (int) $state->version,
+            ];
             if ($source === 'scraped' && !$this->persistedValueEmpty($scraped)) $plugin[$field] = $scraped;
         }
         return ['fields' => $fields, 'plugin' => $plugin];
@@ -681,6 +807,17 @@ final class MetadataSyncScrapeService
     private function persistedValueEmpty(mixed $value): bool
     {
         return $value === null || $value === '' || (is_array($value) && $value === []);
+    }
+
+    /** 把候选协议字段映射到歌曲字段状态键；外部 ID 共享一个 CAS 与来源锁边界。 */
+    private function songStateField(string $candidateField): string
+    {
+        return match ($candidateField) {
+            'albumTitle' => 'album',
+            'isrc', 'musicbrainzTrackId', 'musicbrainzArtistId',
+            'musicbrainzReleaseId', 'musicbrainzReleaseGroupId' => 'externalIds',
+            default => $candidateField,
+        };
     }
 
     /** @return array<string,true> */

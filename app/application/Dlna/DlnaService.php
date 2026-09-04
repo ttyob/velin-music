@@ -158,8 +158,20 @@ final readonly class DlnaService
             $payload = $this->helper->invoke($command);
             $this->rememberResolvedRoute($deviceId, $payload);
         } catch (\Throwable $failure) {
-            if (is_array($ticket)) $this->tickets->revoke($ticket['ticketId']);
-            if ($leaseCreated) $this->leases->release($actor, $deviceId);
+            if (is_array($ticket)) {
+                try {
+                    $this->tickets->revoke($ticket['ticketId']);
+                } catch (\Throwable $compensationFailure) {
+                    $this->logPersistenceFailure('DLNA ticket revocation compensation failed.', $compensationFailure, $requestId);
+                }
+            }
+            if ($leaseCreated) {
+                try {
+                    $this->leases->release($actor, $deviceId);
+                } catch (\Throwable $compensationFailure) {
+                    $this->logPersistenceFailure('DLNA lease release compensation failed.', $compensationFailure, $requestId);
+                }
+            }
             throw $failure;
         }
         try {
@@ -230,14 +242,26 @@ final readonly class DlnaService
             $payload = $this->helper->invoke($command);
             $this->rememberResolvedRoute($deviceId, $payload);
         } catch (\Throwable $failure) {
-            if ($leaseCreated) $this->leases->release($actor, $deviceId);
+            if ($leaseCreated) {
+                try {
+                    $this->leases->release($actor, $deviceId);
+                } catch (\Throwable $compensationFailure) {
+                    $this->logPersistenceFailure('DLNA lease release compensation failed.', $compensationFailure, $requestId);
+                }
+            }
             throw $failure;
         }
         if ($operation === 'status') {
             try {
                 $state = $this->state($payload['state'] ?? null);
             } catch (\Throwable $failure) {
-                if ($leaseCreated) $this->leases->release($actor, $deviceId);
+                if ($leaseCreated) {
+                    try {
+                        $this->leases->release($actor, $deviceId);
+                    } catch (\Throwable $compensationFailure) {
+                        $this->logPersistenceFailure('DLNA lease release compensation failed.', $compensationFailure, $requestId);
+                    }
+                }
                 throw $failure;
             }
             if ($state['transportState'] === 'STOPPED') {
@@ -299,7 +323,10 @@ final readonly class DlnaService
         if (getenv('VELIN_TESTING') === '1') return;
         $context = ['exception_class' => $failure::class];
         if ($requestId !== null && $requestId !== '') $context['request_id'] = $requestId;
-        Log::error($message, $context);
+        try {
+            Log::error($message, $context);
+        } catch (\Throwable) {
+        }
     }
 
     /**

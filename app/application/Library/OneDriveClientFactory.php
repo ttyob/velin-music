@@ -26,8 +26,39 @@ final readonly class OneDriveClientFactory
     ) {
     }
 
-    /** 为一个已证明是 OneDrive 来源的库建立客户端。 */
+    /**
+     * 为一个已证明是 OneDrive 来源的库建立客户端。
+     *
+     * 客户端每次从连接表读取当前授权密文，并使用库当前保存的代理；调用方不得把返回客户端跨任务缓存。
+     */
     public function forLibrary(string $libraryId): OneDriveClient
+    {
+        return $this->buildLibraryClient($libraryId, null, false);
+    }
+
+    /**
+     * 使用库中已有 OAuth 授权、但以调用方提供的代理建立 OneDrive 客户端。
+     *
+     * 该入口只用于代理变更尚未提交时的连接预检：授权身份、refresh token 和远端根仍来自受保护连接表，
+     * 只有网络出口由参数覆盖。代理参数必须已经由 NetworkProxyProfileService 校验，方法不会写数据库；
+     * OneDrive 返回新 refresh token 时仍使用旧密文条件更新，避免预检并发覆盖较新的授权。
+     *
+     * @param array{scheme:string,host:string,port:int,username:string,password:string}|null $proxy
+     */
+    public function forLibraryUsingProxy(string $libraryId, ?array $proxy): OneDriveClient
+    {
+        return $this->buildLibraryClient($libraryId, $proxy, true);
+    }
+
+    /**
+     * 从受保护连接表读取授权事实并构造客户端。
+     *
+     * `$overrideProxy` 用于区分“使用库当前代理”和“明确使用 null 表示直连”，否则关闭代理时无法安全
+     * 覆盖旧值。读取、解密和客户端构造失败均不暴露令牌；客户端生命周期结束后由客户端尽力清零秘密。
+     *
+     * @param array{scheme:string,host:string,port:int,username:string,password:string}|null $proxy
+     */
+    private function buildLibraryClient(string $libraryId, ?array $proxy, bool $overrideProxy): OneDriveClient
     {
         /** @var stdClass|null $row */
         $row = Db::table('onedrive_library_connections as connection')
@@ -49,6 +80,8 @@ final readonly class OneDriveClientFactory
         } catch (\Throwable) {
             throw new OneDriveUnavailable('ONEDRIVE_REAUTHORIZATION_REQUIRED', 'OneDrive 授权不可用，请重新授权。');
         }
+        $effectiveProxy = $overrideProxy ? $proxy : ($row->proxy_profile_id === null ? null
+            : (new NetworkProxyProfileService())->connection((string) $row->proxy_profile_id));
         return $this->forConfiguration(
             (string) $row->tenant_id,
             (string) $row->client_id,
@@ -66,8 +99,7 @@ final readonly class OneDriveClientFactory
                 if ($changed !== 1) throw new \RuntimeException('OneDrive refresh token changed concurrently.');
                 $ciphertext = $replacement;
             },
-            proxy: $row->proxy_profile_id === null ? null
-                : (new NetworkProxyProfileService())->connection((string) $row->proxy_profile_id),
+            proxy: $effectiveProxy,
         );
     }
 

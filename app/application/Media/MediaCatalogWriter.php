@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace app\application\Media;
 
+use app\application\Artist\ArtistNameIdentityNormalizer;
 use app\application\Metadata\MetadataFieldStateRepository;
 use app\application\Metadata\EntityMetadataStateRepository;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use app\application\Search\SearchTextNormalizer;
 use app\infrastructure\Media\FfprobeJsonParser;
 use JsonException;
@@ -33,6 +36,8 @@ final class MediaCatalogWriter
         private readonly MetadataFieldStateRepository $fieldStates = new MetadataFieldStateRepository(),
         private readonly EntityMetadataStateRepository $entityFieldStates = new EntityMetadataStateRepository(),
         private readonly AlbumEditionNameNormalizer $albumEditions = new AlbumEditionNameNormalizer(),
+        private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
+        private readonly ArtistNameIdentityNormalizer $artistNames = new ArtistNameIdentityNormalizer(),
     ) {
     }
 
@@ -67,7 +72,7 @@ final class MediaCatalogWriter
     ): bool {
         // 快照只保存原始标签；文件名和目录语义由刮削插件在任务边界解析。
         $snapshotRawTags = $this->withoutLyricsBodies(($rawMetadata ?? $metadata)->rawTags);
-        return Db::transaction(function () use (
+        [$updated, $songId] = Db::transaction(function () use (
             $inventoryId,
             $libraryId,
             $metadata,
@@ -78,7 +83,7 @@ final class MediaCatalogWriter
             $scrapedMetadata,
             $snapshotRawTags,
             $rawMetadataAuthoritative,
-        ): bool {
+        ): array {
             $now = gmdate('Y-m-d\TH:i:s\Z');
             /** @var stdClass|null $existing */
             $existing = Db::table('media_songs')->where('inventory_file_id', $inventoryId)->first(['id', 'album_id']);
@@ -113,15 +118,10 @@ final class MediaCatalogWriter
                         ? $scrapedMetadata['musicbrainzArtistId'] : null,
                 );
             }
-            $identityParts = [
-                $this->normalize($metadata->albumTitle),
-                implode('|', array_map(fn (string $name): string => $this->normalize($name), $metadata->albumArtists)),
-                (string) ($metadata->releaseYear ?? 0),
-                $metadata->hasTaggedAlbum ? 'tagged' : 'directory:' . $this->normalize(dirname($relativePath)),
-            ];
+            $albumIdentityKeys = $this->albumIdentityKeys($metadata, $relativePath);
             $albumId = $this->albumId(
                 $libraryId,
-                hash('sha256', implode("\n", $identityParts)),
+                $albumIdentityKeys,
                 $metadata,
                 $albumArtistIds,
                 $now,
@@ -250,8 +250,20 @@ final class MediaCatalogWriter
                 $this->refreshAlbumStats($oldAlbumId, $now);
             }
 
-            return $existing instanceof stdClass;
+            return [$existing instanceof stdClass, $songId];
         });
+        // Redis 通知位于 SQLite 提交之后；失败只丢失可重建扩展通知，不能把已完成的媒体索引回滚。
+        $this->pluginEvents->publish(
+            PluginDomainEvent::MEDIA_INDEXED,
+            'song',
+            $songId,
+            payload: [
+                'libraryId' => $libraryId,
+                'scanJobId' => $scanJobId,
+                'change' => $updated ? 'updated' : 'created',
+            ],
+        );
+        return $updated;
     }
 
     /**
@@ -296,14 +308,16 @@ final class MediaCatalogWriter
     /**
      * 返回或创建规范艺术家 ID。
      *
-     * 先按当前显示规范名查找，再按字段状态保存的 raw 名称找回已人工改名实体。第二步是防重复关键边界：
-     * 扫描器不能因为管理员改了显示名，就把仍携带旧标签的歌曲拆到一个新艺术家。调用方位于写事务内，
-     * 新建竞争由 normalized_name 唯一约束阻止并使整首歌曲写入回滚。
+     * 先按有限兼容键查找，再按字段状态保存的 raw 名称找回已人工改名实体。第二步是防重复关键边界：
+     * 扫描器不能因为管理员改了显示名，就把仍携带旧标签的歌曲拆到一个新艺术家。兼容查询与新建位于
+     * 同一 SQLite 写事务，跨 Worker 写入由数据库锁和 busy timeout 串行化；精确同键竞争还会由
+     * normalized_name 唯一约束使整首歌曲写入回滚。方法不执行模糊全表扫描，也不改写已有显示名。
      */
     private function artistId(string $name, ?string $musicbrainzId, string $now): string
     {
-        $normalized = $this->normalize($name);
-        $existing = Db::table('media_artists')->where('normalized_name', $normalized)->value('id');
+        $normalized = $this->artistNames->storageKey($name);
+        $existing = Db::table('media_artists')->whereIn('normalized_name', $this->artistNames->lookupKeys($name))
+            ->orderBy('created_at')->orderBy('id')->value('id');
         if (is_string($existing)) {
             return $existing;
         }
@@ -397,20 +411,22 @@ final class MediaCatalogWriter
      * 可以归并，而两个都没有版次标记的同名不同年份发行不会被自动合并。候选不唯一且无法由年份消歧
      * 时退回精确身份，新建比误合并安全。方法位于歌曲写事务内，不删除历史实体或迁移个人关系。
      *
+     * @param non-empty-list<string> $identityKeys 首项是当前输入的精确键，其余项只覆盖艺人标点/汉字边界空格差异
      * @param list<string> $albumArtistIds 已按标签顺序解析的稳定艺术家 ID；首项用于限制主要署名
      */
     private function albumId(
         string $libraryId,
-        string $identityKey,
+        array $identityKeys,
         MediaMetadata $metadata,
         array $albumArtistIds,
         string $now,
     ): string
     {
-        $existing = $this->editionCompatibleAlbumId($libraryId, $identityKey, $metadata, $albumArtistIds);
+        $identityKey = $identityKeys[0];
+        $existing = $this->editionCompatibleAlbumId($libraryId, $identityKeys, $metadata, $albumArtistIds);
         if (!is_string($existing)) {
             $exact = Db::table('media_albums')->where('library_id', $libraryId)
-                ->where('identity_key', $identityKey)->value('id');
+                ->whereIn('identity_key', $identityKeys)->orderBy('created_at')->orderBy('id')->value('id');
             $existing = is_string($exact) ? $exact : null;
         }
         if (is_string($existing)) {
@@ -472,11 +488,12 @@ final class MediaCatalogWriter
      * 从而让后续重扫逐首收敛到基础专辑。基础标题本身先使用精确键，只有精确实体不存在时才接纳唯一的
      * 版次候选。历史重复实体及其收藏、封面、分享不能在扫描事务中直接删除，须交给可审计合并流程。
      *
+     * @param non-empty-list<string> $identityKeys
      * @param list<string> $albumArtistIds
      */
     private function editionCompatibleAlbumId(
         string $libraryId,
-        string $identityKey,
+        array $identityKeys,
         MediaMetadata $metadata,
         array $albumArtistIds,
     ): ?string {
@@ -538,7 +555,9 @@ final class MediaCatalogWriter
         }
 
         foreach ($candidates as $candidate) {
-            if (hash_equals((string) $candidate->identity_key, $identityKey)) return (string) $candidate->id;
+            foreach ($identityKeys as $identityKey) {
+                if (hash_equals((string) $candidate->identity_key, $identityKey)) return (string) $candidate->id;
+            }
         }
         if (!$incomingHasEdition) {
             $editionCandidates = array_values(array_filter(
@@ -552,6 +571,46 @@ final class MediaCatalogWriter
         }
 
         return null;
+    }
+
+    /**
+     * 生成当前专辑精确身份键及旧艺人排版形式的有限兼容键。
+     *
+     * 旧 identity_key 把专辑艺人的原始空格写进哈希；因此艺人实体已复用后，`G.E.M. 邓紫棋` 与
+     * `G.E.M.邓紫棋` 仍可能命中不同专辑。这里仅对每个署名使用 ArtistNameIdentityNormalizer 给出的
+     * 最多三个精确形式做笛卡尔组合，标题、年份、标签来源和目录身份完全不变。超过 64 个组合时停止
+     * 扩张并保留已生成键，避免恶意多艺人标签放大事务查询；首项始终是当前输入键，可安全用于新建。
+     *
+     * @return non-empty-list<string>
+     */
+    private function albumIdentityKeys(MediaMetadata $metadata, string $relativePath): array
+    {
+        $artistCombinations = [''];
+        foreach ($metadata->albumArtists as $name) {
+            $next = [];
+            foreach ($artistCombinations as $prefix) {
+                foreach ($this->artistNames->lookupKeys($name) as $key) {
+                    $next[] = $prefix === '' ? $key : $prefix . '|' . $key;
+                    if (count($next) >= 64) break 2;
+                }
+            }
+            $artistCombinations = array_values(array_unique($next));
+        }
+        if ($artistCombinations === []) {
+            $artistCombinations = [''];
+        }
+
+        $title = $this->normalize($metadata->albumTitle);
+        $year = (string) ($metadata->releaseYear ?? 0);
+        $source = $metadata->hasTaggedAlbum
+            ? 'tagged'
+            : 'directory:' . $this->normalize(dirname($relativePath));
+        $keys = [];
+        foreach ($artistCombinations as $artists) {
+            $keys[] = hash('sha256', implode("\n", [$title, $artists, $year, $source]));
+        }
+
+        return array_values(array_unique($keys));
     }
 
     /** 候选唯一时直接使用；多个同基础标题实体只有唯一同年项可消歧，否则拒绝自动归并。 */

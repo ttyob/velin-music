@@ -16,6 +16,17 @@ use app\application\ResourcePlugin\PhpResourcePluginPackageUnavailable;
 use app\application\ResourcePlugin\PhpResourcePluginRegistry;
 use app\application\ResourcePlugin\PhpResourcePluginDisabled;
 use app\application\ResourcePlugin\PhpResourcePluginStateService;
+use app\application\ResourcePlugin\Contract\MetadataScrapeLogExportHook;
+use app\application\ResourcePlugin\PluginAdminActionService;
+use app\application\ResourcePlugin\PluginLibraryFileInspectionInvalid;
+use app\application\ResourcePlugin\PluginLibraryFileInspectionNotFound;
+use app\application\ResourcePlugin\PluginLibraryFileInspectionService;
+use app\application\ResourcePlugin\PluginLibraryFileInspectionUnavailable;
+use app\application\ResourcePlugin\PluginStoreConflict;
+use app\application\ResourcePlugin\PluginStoreInvalid;
+use app\application\ResourcePlugin\PluginStoreNotFound;
+use app\application\ResourcePlugin\PluginStoreService;
+use app\application\ResourcePlugin\PluginStoreUnavailable;
 use app\application\ResourcePlugin\ResourcePluginManager;
 use app\application\System\ArtistDatabaseConflict;
 use app\application\System\ArtistDatabaseInvalid;
@@ -42,6 +53,38 @@ final class ResourcePluginController
     public function index(Request $request): Response
     {
         return $this->execute($request, static fn (): array => (new ResourcePluginManager())->list());
+    }
+
+    /** 返回插件商店源地址的脱敏版本号；读取不触发远程请求。 */
+    public function storeConfiguration(Request $request): Response
+    {
+        return $this->execute($request, static fn (): array => (new PluginStoreService())->configuration());
+    }
+
+    /** 按 expectedVersion 保存管理员填写的插件商店索引地址。 */
+    public function updateStoreConfiguration(Request $request): Response
+    {
+        return $this->execute($request, static function (array $actor) use ($request): array {
+            $payload = $request->post();
+            if (!is_array($payload)) throw new PluginStoreInvalid();
+            return (new PluginStoreService())->update($payload, (string) $actor['id'], RequestContext::requestId());
+        });
+    }
+
+    /** 拉取远程索引并返回本机安装状态合并后的插件商店列表。 */
+    public function storeCatalog(Request $request): Response
+    {
+        return $this->execute($request, static fn (): array => (new PluginStoreService())->catalog());
+    }
+
+    /** 只按远程索引中的稳定 key 下载并安装插件，浏览器不能提交地址或覆盖校验信息。 */
+    public function installStorePlugin(Request $request, string $pluginKey): Response
+    {
+        return $this->execute($request, static function (array $actor) use ($request, $pluginKey): array {
+            $payload = $request->post();
+            if (!is_array($payload) || $payload !== []) throw new PluginStoreInvalid();
+            return (new PluginStoreService())->install($pluginKey, (string) $actor['id'], RequestContext::requestId());
+        }, 201);
     }
 
     /** 返回插件升级备份的版本清单，不执行备份代码。 */
@@ -122,6 +165,43 @@ final class ResourcePluginController
                 $pluginKey,
                 $payload['enabled'],
                 $payload['expectedVersion'],
+                (string) $actor['id'],
+                RequestContext::requestId(),
+            );
+        });
+    }
+
+    /**
+     * 返回插件声明且经过核心协议校验的固定管理员动作。
+     *
+     * 读取仍要求实时 Cookie Session 与 `manage_system`，不会执行动作或返回插件配置。插件禁用、升级中、
+     * 数据库版本不匹配或动作清单包含未知字段时失败关闭，不向页面返回不完整清单。
+     */
+    public function adminActions(Request $request, string $pluginKey): Response
+    {
+        return $this->execute($request, static fn (): array =>
+            (new PluginAdminActionService())->actions($pluginKey));
+    }
+
+    /**
+     * 执行一个插件固定管理员动作。
+     *
+     * 请求体只允许 confirmation；普通动作必须为 null，高风险动作必须精确等于 URL 中的 actionKey。
+     * 核心在调用插件前完成 Session、`manage_system`、CSRF、manifest、数据库版本和动作白名单复验，并把
+     * actorId/requestId 从可信上下文注入，浏览器不能提交任意 options、路径、URL 或身份。
+     */
+    public function runAdminAction(Request $request, string $pluginKey, string $actionKey): Response
+    {
+        return $this->execute($request, static function (array $actor) use ($request, $pluginKey, $actionKey): array {
+            $payload = $request->post();
+            if (!is_array($payload) || array_keys($payload) !== ['confirmation']
+                || (!is_string($payload['confirmation']) && $payload['confirmation'] !== null)) {
+                throw new PhpResourcePluginInvalid('PHP_PLUGIN_ADMIN_ACTION_REQUEST_INVALID');
+            }
+            return (new PluginAdminActionService())->execute(
+                $pluginKey,
+                $actionKey,
+                $payload['confirmation'],
                 (string) $actor['id'],
                 RequestContext::requestId(),
             );
@@ -388,6 +468,36 @@ final class ResourcePluginController
             (new PhpResourcePluginRegistry())->metadataScrapeAdmin($pluginKey)->metadataSources());
     }
 
+    /**
+     * 返回插件文件管理器的本地音乐库索引页。
+     *
+     * 页面必须同时具备系统管理和音乐库管理能力，registry 先验证插件显式声明本能力；核心服务随后按
+     * actor 的逐库 manage 范围查询。接口不接受路径参数，也不会触发磁盘扫描或插件代码读取文件。
+     */
+    public function libraryFiles(Request $request, string $pluginKey): Response
+    {
+        return $this->executeLibraryInspection($request, static function (array $actor) use ($request, $pluginKey): array {
+            (new PhpResourcePluginRegistry())->libraryFileInspection($pluginKey);
+            return (new PluginLibraryFileInspectionService())->page(
+                $actor,
+                self::optionalQueryString($request->get('libraryId'), 26),
+                self::optionalQueryString($request->get('q'), 100),
+                self::optionalQueryString($request->get('state'), 32) ?? 'all',
+                self::boundedQueryInteger($request->get('limit'), 20, 1, 50),
+                self::boundedQueryInteger($request->get('offset'), 0, 0, 1_000_000),
+            );
+        });
+    }
+
+    /** 返回重新授权后的单文件、字段来源、歌词正文和封面/专辑对照。 */
+    public function libraryFile(Request $request, string $pluginKey, string $songId): Response
+    {
+        return $this->executeLibraryInspection($request, static function (array $actor) use ($pluginKey, $songId): array {
+            (new PhpResourcePluginRegistry())->libraryFileInspection($pluginKey);
+            return ['file' => (new PluginLibraryFileInspectionService())->detail($actor, $songId)];
+        });
+    }
+
     /** 更新插件来源的启用状态和优先级；插件负责版本 CAS 与字段白名单。 */
     public function updateMetadataSource(Request $request, string $pluginKey, string $sourceKey): Response
     {
@@ -441,6 +551,51 @@ final class ResourcePluginController
     {
         return $this->execute($request, static fn (): array =>
             (new PhpResourcePluginRegistry())->metadataScrapeAdmin($pluginKey)->metadataTask($taskId));
+    }
+
+    /**
+     * 下载一个插件刮削任务的脱敏执行日志。
+     *
+     * 日志导出不是 JSON 操作：插件在生成前重新读取单条任务并执行字段白名单，核心只发送私有临时
+     * 文件。响应禁止缓存并带有校验和；客户端不能提交路径、目标任务列表或其他筛选条件，因此一次
+     * 请求不会意外混入同批次的其他歌曲。插件没有实现可选合同时失败关闭，不回退到直接读数据库。
+     */
+    public function metadataTaskLog(Request $request, string $pluginKey, string $taskId): Response
+    {
+        $requestId = RequestContext::requestId();
+        try {
+            $actor = $this->authorize($request);
+            $plugin = (new PhpResourcePluginRegistry())->metadataScrapeAdmin($pluginKey);
+            if (!$plugin instanceof MetadataScrapeLogExportHook) {
+                throw new PhpResourcePluginInvalid('PHP_PLUGIN_METADATA_SCRAPE_LOG_EXPORT_UNAVAILABLE');
+            }
+            $artifact = $plugin->exportMetadataTaskLog($taskId);
+            if (!isset($artifact['path'], $artifact['downloadName'], $artifact['sha256'], $artifact['byteSize'], $artifact['recordCount'])
+                || !is_string($artifact['path']) || !is_string($artifact['downloadName'])
+                || !is_string($artifact['sha256']) || !is_int($artifact['byteSize']) || !is_int($artifact['recordCount'])
+                || preg_match('/^[a-z0-9][a-z0-9_.-]{1,159}\.json$/D', $artifact['downloadName']) !== 1
+                || preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256']) !== 1
+                || $artifact['byteSize'] < 0 || $artifact['recordCount'] < 0
+                || !is_file($artifact['path']) || is_link($artifact['path'])) {
+                throw new PhpResourcePluginInvalid('PHP_PLUGIN_METADATA_SCRAPE_LOG_EXPORT_INVALID');
+            }
+            $artifactPath = realpath($artifact['path']);
+            $runtimeRoot = realpath(base_path('runtime'));
+            if (!is_string($artifactPath) || !is_string($runtimeRoot)
+                || !str_starts_with($artifactPath, $runtimeRoot . DIRECTORY_SEPARATOR)) {
+                throw new PhpResourcePluginInvalid('PHP_PLUGIN_METADATA_SCRAPE_LOG_EXPORT_INVALID');
+            }
+            return response('', 200, [
+                'Content-Type' => 'application/json; charset=utf-8',
+                'Cache-Control' => 'private, no-store',
+                'X-Content-Type-Options' => 'nosniff',
+                'X-Checksum-SHA256' => $artifact['sha256'],
+                'X-Report-Records' => (string) $artifact['recordCount'],
+                'X-Request-ID' => $requestId,
+            ])->download($artifactPath, $artifact['downloadName']);
+        } catch (Throwable $throwable) {
+            return $this->error($throwable, $requestId);
+        }
     }
 
     /**
@@ -665,6 +820,29 @@ final class ResourcePluginController
         }
     }
 
+    /** @param callable(array<string,mixed>):array<string,mixed> $operation */
+    private function executeLibraryInspection(Request $request, callable $operation): Response
+    {
+        $requestId = RequestContext::requestId();
+        try {
+            $actor = $this->authorize($request);
+            $capabilities = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];
+            if (!in_array('manage_library', $capabilities, true)) throw new AuthorizationDenied();
+            return JsonResponseFactory::create(['data' => $operation($actor), 'meta' => [
+                'requestId' => $requestId, 'timestamp' => gmdate('c'),
+            ]], 200, $requestId);
+        } catch (PluginLibraryFileInspectionInvalid) {
+            return JsonResponseFactory::error('LIBRARY_FILE_INSPECTION_INVALID', '文件筛选条件无效。', 422, $requestId);
+        } catch (PluginLibraryFileInspectionNotFound) {
+            return JsonResponseFactory::error('LIBRARY_FILE_INSPECTION_NOT_FOUND', '文件不存在或不可管理。', 404, $requestId);
+        } catch (PluginLibraryFileInspectionUnavailable $throwable) {
+            return JsonResponseFactory::error($throwable->getMessage() ?: 'LIBRARY_FILE_INSPECTION_UNAVAILABLE',
+                '文件详情暂时不可读取。', 503, $requestId);
+        } catch (Throwable $throwable) {
+            return $this->error($throwable, $requestId);
+        }
+    }
+
     /** @return array<string,mixed> */
     private function authorize(Request $request): array
     {
@@ -750,6 +928,23 @@ final class ResourcePluginController
         return $parsed;
     }
 
+    /**
+     * 解析插件 GET 查询中的可选短文本。
+     *
+     * 数组、对象、非法 UTF-8、控制字符和越界文本直接拒绝；空字符串按未筛选处理。业务枚举和 ULID 仍由
+     * 核心服务复验，避免 Controller 与领域规则形成两份可能漂移的白名单。
+     */
+    private static function optionalQueryString(mixed $value, int $maximumLength): ?string
+    {
+        if ($value === null || $value === '') return null;
+        if (!is_string($value) || !mb_check_encoding($value, 'UTF-8')
+            || mb_strlen($value, 'UTF-8') > $maximumLength
+            || preg_match('/[\x00-\x1F\x7F]/u', $value) === 1) {
+            throw new PluginLibraryFileInspectionInvalid('LIBRARY_FILE_INSPECTION_QUERY_INVALID');
+        }
+        return $value;
+    }
+
     /** 对文件与 JSON 请求使用同一脱敏错误合同。 */
     private function error(Throwable $throwable, string $requestId): Response
     {
@@ -763,6 +958,10 @@ final class ResourcePluginController
             $throwable instanceof PhpResourcePluginInvalid,
                 $throwable instanceof \InvalidArgumentException => ['PLUGIN_REQUEST_INVALID', '插件请求无效。', 422],
             $throwable instanceof PhpResourcePluginPackageUnavailable => ['PLUGIN_STORAGE_UNAVAILABLE', '插件存储暂时不可用。', 507],
+            $throwable instanceof PluginStoreConflict => ['PLUGIN_STORE_VERSION_CONFLICT', '插件源配置已变化，请刷新后重试。', 409],
+            $throwable instanceof PluginStoreNotFound => ['PLUGIN_STORE_PLUGIN_NOT_FOUND', '远程插件源中不存在该插件。', 404],
+            $throwable instanceof PluginStoreInvalid => ['PLUGIN_STORE_INVALID', '插件源或插件包不符合规则。', 422],
+            $throwable instanceof PluginStoreUnavailable => ['PLUGIN_STORE_UNAVAILABLE', '插件商店暂时不可用。', 503],
             $throwable instanceof ArtistDatabaseUploadNotFound => ['ARTIST_DATABASE_UPLOAD_NOT_FOUND', '上传会话不存在或已过期。', 404],
             $throwable instanceof ArtistDatabaseConflict => ['ARTIST_DATABASE_UPLOAD_CONFLICT', '上传状态已变化，请刷新后重试。', 409],
             $throwable instanceof ArtistDatabaseInvalid => ['ARTIST_DATABASE_INVALID', '文件不是符合要求的艺人 SQLite 数据库。', 422],

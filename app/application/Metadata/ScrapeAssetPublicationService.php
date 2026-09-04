@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace app\application\Metadata;
 
+use app\application\Storage\StorageLayout;
+use app\application\Artwork\ArtworkBlobStore;
+
 use Closure;
 use app\application\Auth\CapabilityResolver;
 use app\application\Library\LibraryAccessResolver;
@@ -40,6 +43,7 @@ final class ScrapeAssetPublicationService
         private readonly RemoteLibraryClientFactory $remoteClients = new RemoteLibraryClientFactory(),
         private readonly SqliteTransientRetry $sqliteRetry = new SqliteTransientRetry(),
         private readonly SqliteWriteGate $sqliteWriteGate = new SqliteWriteGate(),
+        private readonly ArtworkBlobStore $artworkBlobs = new ArtworkBlobStore(),
     ) {}
 
     /**
@@ -345,15 +349,18 @@ final class ScrapeAssetPublicationService
         $source = Db::table('media_manual_artwork_candidates')->where('id', (string) $row->source_record_id)
             ->where('song_id', (string) $row->song_id)->where('library_id', (string) $row->library_id)
             ->first(['image_bytes', 'byte_size', 'content_sha256', 'mime_type']);
-        if (!$source instanceof stdClass || (string) $source->mime_type !== 'image/webp'
-            || strlen((string) $source->image_bytes) !== (int) $source->byte_size
+        try {
+            $bytes = $source instanceof stdClass ? $this->artworkBlobs->bytes($source) : '';
+        } catch (\RuntimeException) {
+            $bytes = '';
+        }
+        if (!$source instanceof stdClass || $bytes === '' || (string) $source->mime_type !== 'image/webp'
             || !hash_equals((string) $row->source_sha256, (string) $source->content_sha256)
-            || !hash_equals((string) $source->content_sha256, hash('sha256', (string) $source->image_bytes))
             || (string) $row->license_policy !== 'cache_allowed'
             || !$this->licenseAllows((string) $row->license_policy, (string) $row->storage_mode)) {
             throw new ScrapeAssetPublicationFailed('SCRAPE_ASSET_SOURCE_STALE');
         }
-        return [(string) $source->image_bytes, 'webp'];
+        return [$bytes, 'webp'];
     }
 
     /**
@@ -570,11 +577,6 @@ final class ScrapeAssetPublicationService
     /** 返回并校验部署固定的缓存根；HTTP 和数据库均不能覆盖该路径。 */
     private function cacheRoot(): string
     {
-        $path = rtrim((string) (getenv('VELIN_SCRAPE_CACHE_PATH') ?: '/media/cache/scrape'), DIRECTORY_SEPARATOR);
-        if (!str_starts_with($path, '/media/') || str_contains($path, "\0")
-            || preg_match('#(?:^|/)(?:\.|\.\.)(?:/|$)#', $path) === 1) {
-            throw new ScrapeAssetPublicationFailed('SCRAPE_ASSET_CACHE_ROOT_INVALID');
-        }
-        return $path;
+        return StorageLayout::SCRAPE_CACHE_ROOT;
     }
 }

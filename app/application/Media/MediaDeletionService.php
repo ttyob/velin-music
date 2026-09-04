@@ -4,7 +4,11 @@ declare(strict_types=1);
 
 namespace app\application\Media;
 
+use app\application\Storage\StorageLayout;
+
 use app\application\Scan\ScanJobService;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use app\infrastructure\Audit\AuditLogger;
 use stdClass;
 use Symfony\Component\Uid\Ulid;
@@ -26,6 +30,9 @@ final class MediaDeletionService
     public function __construct(
         private readonly AuditLogger $audit = new AuditLogger(),
         private readonly ScanJobService $scans = new ScanJobService(),
+        private readonly PluginEventPublisher $events = new PluginEventPublisher(),
+        private readonly string $configuredTrashRoot = StorageLayout::TRASH_ROOT,
+        private readonly string $configuredStorageRoot = StorageLayout::STORAGE_ROOT,
     )
     {
     }
@@ -129,7 +136,35 @@ final class MediaDeletionService
             throw new MediaDeletionUnavailable('删除提交失败，已尝试恢复媒体文件。', previous: $failure);
         }
 
+        $this->events->publish(PluginDomainEvent::MEDIA_DELETED, 'song', $songId, 'user', (string) $actor['id'], [
+            'action' => 'moved_to_trash',
+            'deletionId' => $deletionId,
+            'libraryId' => (string) $row->library_id,
+        ]);
         return ['deleted' => true, 'deletionId' => $deletionId, 'songId' => $songId, 'status' => 'completed'];
+    }
+
+    /**
+     * 在批量实体删除开始前复验一首本地歌曲的文件身份。
+     *
+     * 该方法只做无副作用的前置检查，供专辑/艺人删除先检查全部本地文件，减少批量操作执行到一半才
+     * 发现路径漂移的概率。它不提供删除授权，也不替代真正删除时再次执行的身份检查；检查通过后文件
+     * 仍可能被其他进程替换，后续 `delete()` 会重新加固校验并在数据库失败时补偿移动。
+     *
+     * @param array<string,mixed> $actor 已通过 `manage_library` 全局能力校验的操作者。
+     * @throws MediaDeletionInvalid 歌曲 ID 或回收根配置无效。
+     * @throws MediaDeletionNotFound 歌曲不存在、失权、外部库或文件不可管理。
+     * @throws MediaDeletionConflict 文件路径或身份已变化。
+     */
+    public function assertDeletable(array $actor, string $songId): void
+    {
+        if (!Ulid::isValid($songId)) throw new MediaDeletionInvalid('歌曲标识无效。');
+        $row = $this->findManagedLocalSong($actor, $songId);
+        if (!$row instanceof stdClass || (string) $row->source_type !== 'local') {
+            throw new MediaDeletionNotFound('歌曲不存在或不可管理。');
+        }
+        $this->assertLocalFileIdentity($row);
+        $this->assertTrashDoesNotOverlapLibraries($this->trashRoot());
     }
 
     /**
@@ -504,20 +539,20 @@ final class MediaDeletionService
         }
     }
 
-    /** 创建并校验固定媒体回收根；环境变量只能选择 `/media` 下的非缓存目录。 */
+    /**
+     * 创建并校验固定媒体回收根。
+     *
+     * 生产回收站固定为 `/storage/.velin-trash`，与音乐库处于同一挂载点以保证 rename 原子性，但位于
+     * `/storage/music` 之外，扫描器不会重新发现被回收媒体。可选构造参数仅允许隔离测试提供同盘临时根，
+     * 路径不接受环境变量、请求或数据库覆盖；根与其声明的存储父目录不一致时失败关闭。创建失败保留
+     * 源文件并终止删除，重复调用只复验同一个真实非链接目录。
+     */
     private function trashRoot(): string
     {
-        $root = rtrim((string) (getenv('VELIN_MEDIA_TRASH_PATH') ?: '/media/.velin-trash'), DIRECTORY_SEPARATOR);
-        if ($root === '' || !str_starts_with($root, '/media/') || str_contains($root, "\0")
-            || preg_match('#(?:^|/)(?:\\.|\\.\\.)(?:/|$)#', $root) === 1) {
-            throw new MediaDeletionInvalid('媒体回收根目录配置无效。');
-        }
-        $cache = rtrim((string) (getenv('VELIN_SCRAPE_CACHE_PATH') ?: '/media/cache/scrape'), DIRECTORY_SEPARATOR);
-        if ($root === $cache || str_starts_with($root . '/', $cache . '/') || str_starts_with($cache . '/', $root . '/')) {
-            throw new MediaDeletionInvalid('媒体回收根目录不能与刮削缓存重叠。');
-        }
+        $root = rtrim($this->configuredTrashRoot, DIRECTORY_SEPARATOR);
+        $storageRoot = rtrim($this->configuredStorageRoot, DIRECTORY_SEPARATOR);
         $parent = realpath(dirname($root));
-        if ($parent === false || !str_starts_with($parent . '/', '/media/')) {
+        if ($parent !== $storageRoot || realpath($storageRoot) !== $storageRoot || is_link($storageRoot)) {
             throw new MediaDeletionUnavailable('媒体回收根目录父目录不可用。');
         }
         if (file_exists($root) && is_link($root)) {

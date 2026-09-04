@@ -51,6 +51,29 @@ final class MetadataSyncScrapeController
             fn (array $actor): array => ['job' => $this->service->show($actor, $jobId)]);
     }
 
+    /**
+     * 使用历史 target 中已保存的插件字段。
+     *
+     * 请求只携带字段名和当前字段版本，不接收任何候选值。服务层从候选快照取值并复验任务所有权、
+     * `run_scrape`、实时库授权、字段 evidence 与 CAS；成功响应返回刷新后的父任务详情。
+     */
+    public function applyStoredCandidate(Request $request, string $targetId): Response
+    {
+        return $this->execute($request, function (array $actor, string $requestId) use ($request, $targetId): array {
+            $payload = $request->post();
+            if (!is_array($payload) || array_keys($payload) !== ['fields', 'expectedVersions']) {
+                throw new MediaMetadataInvalid('历史刮削字段应用结构无效。');
+            }
+            return ['job' => $this->service->applyStoredCandidateFields(
+                $actor,
+                $targetId,
+                $payload['fields'],
+                $payload['expectedVersions'],
+                $requestId,
+            )];
+        });
+    }
+
     /** 返回当前管理员可管理音乐库内的逐曲历史；列表不读取平台响应、正文、图片或路径。 */
     public function history(Request $request): Response
     {

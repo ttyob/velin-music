@@ -8,6 +8,7 @@ use app\application\Artwork\ArtworkService;
 use app\application\Artwork\ArtworkTransformService;
 use app\application\Subsonic\SubsonicArtworkTicketService;
 use app\http\RequestContext;
+use app\http\LocalFileResponseFactory;
 use support\Log;
 use support\Request;
 use support\Response;
@@ -46,7 +47,13 @@ final class SubsonicArtworkController
                 'X-Request-ID' => $requestId,
             ];
             if (strtoupper($request->method()) === 'HEAD') return response('', 200, $headers);
-            return response('', 200, $headers)->withFile($artwork->path);
+            return (new LocalFileResponseFactory())->create(
+                $artwork->path,
+                200,
+                $headers,
+                0,
+                $artwork->fileSize,
+            );
         } catch (Throwable $throwable) {
             Log::warning('Subsonic ticketed artwork request failed.', [
                 'request_id' => $requestId,

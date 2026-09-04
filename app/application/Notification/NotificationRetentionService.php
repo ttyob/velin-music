@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\Notification;
 
+use app\infrastructure\Database\SqliteWriteGate;
 use support\Db;
 
 /**
@@ -16,6 +17,10 @@ use support\Db;
  */
 final class NotificationRetentionService
 {
+    public function __construct(private readonly SqliteWriteGate $writeGate = new SqliteWriteGate())
+    {
+    }
+
     /**
      * Deletes at most one bounded batch from each retention table.
      *
@@ -34,7 +39,7 @@ final class NotificationRetentionService
             throw new NotificationRetentionInvalid('Retention batch is outside the supported range.');
         }
 
-        return Db::transaction(function () use ($cutoffUtc, $limit): array {
+        return $this->writeGate->run(fn (): array => Db::transaction(function () use ($cutoffUtc, $limit): array {
             /** @var list<string> $notificationIds */
             $notificationIds = Db::table('user_notifications')
                 ->where('expires_at', '<=', $cutoffUtc)
@@ -53,6 +58,6 @@ final class NotificationRetentionService
                 ->whereIn('sequence', $eventSequences)->where('expires_at', '<=', $cutoffUtc)->delete();
 
             return ['notifications' => $notifications, 'realtimeEvents' => $events];
-        });
+        }));
     }
 }

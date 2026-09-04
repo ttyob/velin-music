@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace app\process;
 
 use app\application\Recommendation\LastfmRecommendationService;
+use app\application\Recommendation\LastfmRecommendationUnavailable;
+use app\application\Recommendation\PublicPlaylistCatalogUnavailable;
 use app\application\Recommendation\PublicPlaylistRecommendationService;
 use support\Log;
 use Symfony\Component\Uid\Ulid;
@@ -56,8 +58,18 @@ final class LastfmPlaylistSyncWorker
             if (!$this->recommendations->syncOneDue($requestId)) {
                 $this->publicRecommendations->syncOneDue($requestId);
             }
+        } catch (PublicPlaylistCatalogUnavailable) {
+            // 公开榜单由第三方插件提供；上游暂时不可用时保留旧歌单，不应制造系统级 error 记录。
+            Log::warning('Public playlist catalog is temporarily unavailable.', [
+                'error_code' => 'PUBLIC_PLAYLIST_PLUGIN_UNAVAILABLE',
+            ]);
+        } catch (LastfmRecommendationUnavailable) {
+            // Last.fm 的网络或目录暂不可用属于可重试外部故障，下一轮仍会按规则冷却时间继续处理。
+            Log::warning('Last.fm playlist catalog is temporarily unavailable.', [
+                'error_code' => 'LASTFM_REFRESH_FAILED',
+            ]);
         } catch (Throwable $throwable) {
-            Log::error('Last.fm playlist sync tick failed.', ['exception_class' => $throwable::class]);
+            Log::error('Playlist catalog sync tick failed.', ['exception_class' => $throwable::class]);
         } finally {
             $this->busy = false;
             Context::destroy();

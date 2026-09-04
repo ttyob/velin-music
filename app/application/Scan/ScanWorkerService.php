@@ -14,6 +14,8 @@ use app\application\Media\WebDavMetadataIndexer;
 use app\application\Metadata\AutomaticSongScrapeScheduler;
 use app\application\Notification\NotificationPublisher;
 use app\application\Playlist\M3uSyncService;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use app\infrastructure\Audit\AuditLogger;
 use app\infrastructure\Database\SqliteTransientRetry;
 use app\infrastructure\Database\SqliteWriteGate;
@@ -54,6 +56,8 @@ final class ScanWorkerService
         private readonly AutomaticSongScrapeScheduler $automaticScrapes = new AutomaticSongScrapeScheduler(),
         private readonly SqliteTransientRetry $sqliteRetry = new SqliteTransientRetry(),
         private readonly SqliteWriteGate $sqliteWriteGate = new SqliteWriteGate(),
+        private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
+        private readonly ScanPostCommitActionRunner $postCommitActions = new ScanPostCommitActionRunner(),
     ) {
     }
 
@@ -166,7 +170,7 @@ final class ScanWorkerService
                 ->orderBy('jobs.created_at')
                 ->first([
                     'jobs.id', 'jobs.library_id', 'jobs.requested_by', 'jobs.request_id',
-                    'jobs.scan_type', 'libraries.root_path', 'libraries.resolved_root_path',
+                    'jobs.scan_type', 'jobs.relative_path', 'libraries.root_path', 'libraries.resolved_root_path',
                     'libraries.symlink_policy', 'libraries.source_type', 'libraries.remote_metadata_mode',
                 ]);
             if (!$row instanceof stdClass) {
@@ -203,6 +207,7 @@ final class ScanWorkerService
                 'requestedBy' => $row->requested_by === null ? null : (string) $row->requested_by,
                 'requestId' => (string) $row->request_id,
                 'scanType' => (string) $row->scan_type,
+                'relativePath' => $row->relative_path === null ? null : (string) $row->relative_path,
                 'rootPath' => (string) $row->root_path,
                 'resolvedRootPath' => (string) $row->resolved_root_path,
                 'symlinkPolicy' => (string) $row->symlink_policy,
@@ -266,11 +271,15 @@ final class ScanWorkerService
         $metadataStats = ['parsedFiles' => 0, 'failedFiles' => 0, 'updatedFiles' => 0];
 
         try {
-            // A reclaimed attempt owns a fresh report; stale partial rows must not masquerade as
-            // files processed by the new attempt if its traversal ends earlier or is cancelled.
-            Db::table('library_scan_file_results')->where('scan_job_id', $jobId)->delete();
+            // 重领任务必须先丢弃旧尝试的临时报告；删除属于幂等短写入，统一经过 SQLite 写闸门，不能让
+            // 自动扫描与其他 Worker 在 busy_timeout 到期后随机竞争失败。
+            $this->writeTransaction(static function () use ($jobId): void {
+                Db::table('library_scan_file_results')->where('scan_job_id', $jobId)->delete();
+            });
             $sourceType = (string) ($job['sourceType'] ?? 'local');
+            $relativePath = is_string($job['relativePath'] ?? null) ? (string) $job['relativePath'] : null;
             $remote = null;
+            $scanDirectory = null;
             if ($sourceType !== 'local') {
                 $remote = $this->remoteClients->forLibrary($libraryId);
                 $remote->assertConnection();
@@ -280,6 +289,7 @@ final class ScanWorkerService
                 if ($resolvedRoot !== (string) $job['resolvedRootPath']) {
                     throw new LibraryPathInvalid('音乐库根目录身份已变化。');
                 }
+                $scanDirectory = $this->resolveScopedLocalDirectory($resolvedRoot, $relativePath);
             }
 
             $checkpoint = function (int $processedEntries) use (
@@ -300,19 +310,31 @@ final class ScanWorkerService
                 }
                 if (time() - $lastHeartbeat >= 2) {
                     $now = gmdate('Y-m-d\TH:i:s\Z');
-                    Db::table('library_scan_jobs')->where('id', $jobId)->where('status', 'running')->update([
-                        'processed_entries' => $processedEntries,
-                        'discovered_files' => $discoveredFiles,
-                        'heartbeat_at' => $now,
-                        'updated_at' => $now,
-                    ]);
+                    $this->writeTransaction(static function () use (
+                        $discoveredFiles,
+                        $jobId,
+                        $now,
+                        $processedEntries,
+                    ): void {
+                        Db::table('library_scan_jobs')->where('id', $jobId)->where('status', 'running')->update([
+                            'processed_entries' => $processedEntries,
+                            'discovered_files' => $discoveredFiles,
+                            'heartbeat_at' => $now,
+                            'updated_at' => $now,
+                        ]);
+                    });
                     $lastHeartbeat = time();
                 }
             };
 
             $generator = $sourceType !== 'local'
-                ? $this->webDavDiscovery->files($libraryId, $remote, $checkpoint)
-                : $this->discovery->files($resolvedRoot, (string) $job['symlinkPolicy'], $checkpoint);
+                ? $this->webDavDiscovery->files($libraryId, $remote, $checkpoint, $relativePath)
+                : $this->discovery->files(
+                    $resolvedRoot,
+                    (string) $job['symlinkPolicy'],
+                    $checkpoint,
+                    $scanDirectory,
+                );
             foreach ($generator as $file) {
                 if ($file instanceof DiscoveredM3uSource) {
                     $sourceBatch[] = $file;
@@ -341,12 +363,13 @@ final class ScanWorkerService
             /**
              * realpath 相同只能证明路径字符串未变化，不能证明多个 Worker 看到的是同一个挂载内容。
              * 在任何元数据或缺失校准前读取实时可用库存并拦截“已有媒体却发现零文件”的结果，避免
-             * 宿主机与容器同时连接同一 SQLite 时，空的宿主机 `/media` 隐藏容器内全部歌曲。
+             * 宿主机与容器同时连接同一 SQLite 时，空的宿主机 `/storage` 会隐藏容器内全部歌曲。
              */
-            $availableInventoryFiles = Db::table('library_file_inventory')
+            $availableInventoryQuery = Db::table('library_file_inventory')
                 ->where('library_id', $libraryId)
-                ->where('status', 'available')
-                ->count();
+                ->where('status', 'available');
+            $this->scopeRelativePathQuery($availableInventoryQuery, $relativePath);
+            $availableInventoryFiles = $availableInventoryQuery->count();
             $this->reconciliationGuard->assertSafe($discoveredFiles, $availableInventoryFiles);
 
             /**
@@ -357,13 +380,15 @@ final class ScanWorkerService
             $metadataCheckpoint = function (int $parsed, int $failed, int $updated) use ($checkpoint, $stats, $jobId): void {
                     $checkpoint((int) $stats['processedEntries']);
                     $now = gmdate('Y-m-d\TH:i:s\Z');
-                    Db::table('library_scan_jobs')->where('id', $jobId)->where('status', 'running')->update([
-                        'metadata_parsed_files' => $parsed,
-                        'metadata_failed_files' => $failed,
-                        'updated_files' => $updated,
-                        'heartbeat_at' => $now,
-                        'updated_at' => $now,
-                    ]);
+                    $this->writeTransaction(static function () use ($failed, $jobId, $now, $parsed, $updated): void {
+                        Db::table('library_scan_jobs')->where('id', $jobId)->where('status', 'running')->update([
+                            'metadata_parsed_files' => $parsed,
+                            'metadata_failed_files' => $failed,
+                            'updated_files' => $updated,
+                            'heartbeat_at' => $now,
+                            'updated_at' => $now,
+                        ]);
+                    });
                 };
             $metadataStats = $sourceType !== 'local'
                 ? $this->webDavMetadata->index(
@@ -378,59 +403,76 @@ final class ScanWorkerService
             // Mount or symlink replacement after traversal invalidates the entire reconciliation.
             if ($sourceType !== 'local') {
                 $remote->assertConnection();
-            } elseif ($this->paths->resolve((string) $job['rootPath']) !== (string) $job['resolvedRootPath']) {
-                throw new LibraryPathInvalid('音乐库根目录身份已变化。');
+            } else {
+                if ($this->paths->resolve((string) $job['rootPath']) !== (string) $job['resolvedRootPath']) {
+                    throw new LibraryPathInvalid('音乐库根目录身份已变化。');
+                }
+                if ($this->resolveScopedLocalDirectory($resolvedRoot, $relativePath) !== $scanDirectory) {
+                    throw new LibraryPathInvalid('扫描子目录身份已变化。');
+                }
             }
             $now = gmdate('Y-m-d\TH:i:s\Z');
-            $phaseChanged = Db::table('library_scan_jobs')->where('id', $jobId)->where('status', 'running')->update([
-                'phase' => 'reconciling',
-                'processed_entries' => (int) $stats['processedEntries'],
-                'discovered_files' => $discoveredFiles,
-                'ignored_entries' => (int) $stats['ignoredEntries'],
-                'failed_entries' => (int) $stats['failedEntries'],
-                'metadata_parsed_files' => $metadataStats['parsedFiles'],
-                'metadata_failed_files' => $metadataStats['failedFiles'],
-                'updated_files' => $metadataStats['updatedFiles'],
-                'heartbeat_at' => $now,
-                'updated_at' => $now,
-            ]);
+            $phaseChanged = $this->writeTransaction(static function () use (
+                $discoveredFiles,
+                $jobId,
+                $metadataStats,
+                $now,
+                $stats,
+            ): int {
+                return Db::table('library_scan_jobs')->where('id', $jobId)->where('status', 'running')->update([
+                    'phase' => 'reconciling',
+                    'processed_entries' => (int) $stats['processedEntries'],
+                    'discovered_files' => $discoveredFiles,
+                    'ignored_entries' => (int) $stats['ignoredEntries'],
+                    'failed_entries' => (int) $stats['failedEntries'],
+                    'metadata_parsed_files' => $metadataStats['parsedFiles'],
+                    'metadata_failed_files' => $metadataStats['failedFiles'],
+                    'updated_files' => $metadataStats['updatedFiles'],
+                    'heartbeat_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            });
             if ($phaseChanged !== 1) {
                 $this->throwForLostLease($jobId);
             }
 
-            $this->writeTransaction(function () use (
+            $addedFiles = $this->writeTransaction(function () use (
                 $discoveredFiles,
                 $job,
                 $jobId,
                 $libraryId,
                 $metadataStats,
                 $now,
+                $relativePath,
                 $stats,
-            ): void {
+            ): int {
                 $status = Db::table('library_scan_jobs')->where('id', $jobId)->value('status');
                 if ($status !== 'running') {
                     $this->throwForLostLease($jobId);
                 }
                 $missingFiles = 0;
                 if ((int) $stats['failedEntries'] === 0) {
-                    $missingFiles = Db::table('library_file_inventory')
+                    $missingInventory = Db::table('library_file_inventory')
                         ->where('library_id', $libraryId)
                         ->where('status', 'available')
-                        ->where('last_seen_scan_job_id', '!=', $jobId)
-                        ->update([
+                        ->where('last_seen_scan_job_id', '!=', $jobId);
+                    $this->scopeRelativePathQuery($missingInventory, $relativePath);
+                    $missingFiles = $missingInventory->update([
                             'status' => 'missing',
                             'missing_since' => $now,
                             'updated_at' => $now,
                         ]);
-                    Db::table('library_m3u_sources')->where('library_id', $libraryId)
-                        ->where('status', 'available')->where('last_seen_scan_job_id', '!=', $jobId)
-                        ->update(['status' => 'missing', 'missing_since' => $now, 'updated_at' => $now]);
+                    $missingSources = Db::table('library_m3u_sources')->where('library_id', $libraryId)
+                        ->where('status', 'available')->where('last_seen_scan_job_id', '!=', $jobId);
+                    $this->scopeRelativePathQuery($missingSources, $relativePath);
+                    $missingSources->update(['status' => 'missing', 'missing_since' => $now, 'updated_at' => $now]);
                     // Missing source state belongs to the same trustworthy full-pass reconciliation.
                     // Rules are retained for recovery, but a stale file can no longer be read or synced.
                     Db::table('playlist_m3u_sync_rules')
-                        ->whereIn('source_id', function ($query) use ($libraryId): void {
+                        ->whereIn('source_id', function ($query) use ($libraryId, $relativePath): void {
                             $query->select('id')->from('library_m3u_sources')
                                 ->where('library_id', $libraryId)->where('status', 'missing');
+                            $this->scopeRelativePathQuery($query, $relativePath);
                         })->where('status', '!=', 'missing')->update([
                             'status' => 'missing', 'error_code' => 'SOURCE_MISSING',
                             'version' => Db::raw('version + 1'), 'updated_at' => $now,
@@ -512,29 +554,44 @@ SQL, [$now, $libraryId]);
                     'addedFiles' => $addedFiles,
                     'failedEntries' => (int) $stats['failedEntries'],
                 ], null, $now);
+                // 后置插件事件只能读取已经提交的数值快照；显式返回可避免 PHP 闭包局部变量在事务外未定义。
+                return $addedFiles;
             });
-            try {
-                // Sync is a post-scan personal workflow. Per-rule failures are isolated by the service;
-                // an infrastructure failure here is logged but cannot rewrite the already truthful scan.
-                $this->m3uSync->synchronizeLibrary($libraryId, (string) $job['requestId']);
-            } catch (Throwable $syncFailure) {
-                Log::warning('M3U post-scan synchronization was deferred.', [
-                    'request_id' => (string) $job['requestId'],
-                    'library_id' => $libraryId,
-                    'exception_class' => $syncFailure::class,
-                ]);
-            }
-            try {
-                // 系统自动扫描只把本次真正索引成功的歌曲交给统一逐曲刮削。调度失败不能篡改已经提交的
-                // 扫描终态；确定 requestId 让进程重启后的补偿调用保持幂等。
-                $this->automaticScrapes->dispatch($job);
-            } catch (Throwable $scrapeFailure) {
-                Log::warning('Automatic song scrape dispatch was deferred.', [
-                    'request_id' => (string) $job['requestId'],
-                    'library_id' => $libraryId,
-                    'exception_class' => $scrapeFailure::class,
-                ]);
-            }
+            // succeeded 已在上方事务中成为唯一真实终态。三个后置动作逐个隔离，即使动作与其告警同时失败，
+            // 后续自动刮削仍必须调度；确定 requestId/scanId 由各服务维持重启补偿时的幂等性。
+            $postCommitContext = [
+                'request_id' => (string) $job['requestId'],
+                'library_id' => $libraryId,
+                'scan_job_id' => $jobId,
+            ];
+            $this->postCommitActions->run(
+                fn (): ?string => $this->pluginEvents->publish(
+                    PluginDomainEvent::LIBRARY_SCAN_COMPLETED,
+                    'library_scan_job',
+                    $jobId,
+                    payload: [
+                        'libraryId' => $libraryId,
+                        'status' => 'succeeded',
+                        'discoveredFiles' => $discoveredFiles,
+                        'addedFiles' => $addedFiles,
+                        'failedEntries' => (int) $stats['failedEntries'],
+                    ],
+                ),
+                'Post-scan plugin event publication was discarded.',
+                $postCommitContext,
+            );
+            $this->postCommitActions->run(
+                function () use ($job, $libraryId): void {
+                    $this->m3uSync->synchronizeLibrary($libraryId, (string) $job['requestId']);
+                },
+                'M3U post-scan synchronization was deferred.',
+                $postCommitContext,
+            );
+            $this->postCommitActions->run(
+                fn (): int => $this->automaticScrapes->dispatch($job),
+                'Automatic song scrape dispatch was deferred.',
+                $postCommitContext,
+            );
         } catch (ScanExecutionCancelled) {
             $this->finishCancelled($job);
         } catch (ScanExecutionInterrupted) {
@@ -544,6 +601,45 @@ SQL, [$now, $libraryId]);
         } catch (Throwable $throwable) {
             $this->finishFailed($job, $throwable);
         }
+    }
+
+    /**
+     * 从已验证真实库根解析本次本地扫描起点。
+     *
+     * 相对目录来自任务快照但不作为授权；每一段都拒绝符号链接，最终 realpath 必须仍
+     * 位于根内且可读。调用在遍历前后各执行一次，目录被替换或移出根时整次扫描失败，
+     * 不进行缺失校准。NULL 表示根目录并保持历史整库行为。
+     */
+    private function resolveScopedLocalDirectory(string $root, ?string $relativePath): string
+    {
+        if ($relativePath === null) return $root;
+        $candidate = $root;
+        foreach (explode('/', $relativePath) as $segment) {
+            if ($segment === '' || $segment === '.' || $segment === '..') {
+                throw new LibraryPathInvalid('扫描子目录无效。');
+            }
+            $candidate .= DIRECTORY_SEPARATOR . $segment;
+            if (is_link($candidate)) throw new LibraryPathInvalid('扫描子目录不能经过符号链接。');
+        }
+        $resolved = realpath($candidate);
+        if (!is_string($resolved) || !str_starts_with($resolved, $root . DIRECTORY_SEPARATOR)
+            || !is_dir($resolved) || !is_readable($resolved)) {
+            throw new LibraryPathInvalid('扫描子目录不存在或不可读取。');
+        }
+        return $resolved;
+    }
+
+    /**
+     * 把缺失校准与安全阈值查询限制在同一库内子树。
+     *
+     * 百分号、下划线和转义符按 SQLite LIKE 规则转义，防止合法文件夹名扩大匹配范围；
+     * 库存表只含文件，因此匹配 `目录/%`。NULL 不追加条件，保留整库扫描语义。
+     */
+    private function scopeRelativePathQuery(mixed $query, ?string $relativePath): void
+    {
+        if ($relativePath === null) return;
+        $escaped = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $relativePath);
+        $query->whereRaw("relative_path LIKE ? ESCAPE '!'", [$escaped . '/%']);
     }
 
     /**
@@ -780,8 +876,8 @@ SQL);
             default => '扫描执行失败，旧索引未被批量清除。',
         };
         $now = gmdate('Y-m-d\TH:i:s\Z');
-        $this->writeTransaction(function () use ($code, $job, $message, $now): void {
-            Db::table('library_scan_jobs')->where('id', (string) $job['id'])
+        $transitioned = $this->writeTransaction(function () use ($code, $job, $message, $now): bool {
+            $changed = Db::table('library_scan_jobs')->where('id', (string) $job['id'])
                 ->whereIn('status', ['running', 'cancel_requested'])
                 ->update([
                     'status' => 'failed',
@@ -792,6 +888,9 @@ SQL);
                     'error_message' => $message,
                     'updated_at' => $now,
                 ]);
+            // 事务提交后发生的扩展异常可能再次进入此收口。条件更新未命中表示任务已有真实终态；此时
+            // 必须保持幂等并停止，不能把 succeeded 音乐库改成 error，也不能制造第二条失败审计/通知。
+            if ($changed !== 1) return false;
             Db::table('music_libraries')->where('id', (string) $job['libraryId'])->update([
                 'scan_status' => 'error',
                 'version' => Db::raw('version + 1'),
@@ -809,12 +908,37 @@ SQL);
             $this->notifications->publishScanTerminal($job, 'failed', [
                 'failedEntries' => 1,
             ], $code, $now);
+            return true;
         });
-        Log::error('Library scan Worker failed.', [
+        if (!$transitioned) return;
+
+        $failureContext = [
             'job_id' => (string) $job['id'],
-            'exception_class' => $throwable::class,
             'error_code' => $code,
-        ]);
+        ];
+        $this->postCommitActions->run(
+            fn (): ?string => $this->pluginEvents->publish(
+                PluginDomainEvent::LIBRARY_SCAN_COMPLETED,
+                'library_scan_job',
+                (string) $job['id'],
+                payload: [
+                    'libraryId' => (string) $job['libraryId'],
+                    'status' => 'failed',
+                    'errorCode' => $code,
+                ],
+            ),
+            'Failed-scan plugin event publication was discarded.',
+            $failureContext,
+        );
+        $this->postCommitActions->run(
+            static fn (): mixed => Log::error('Library scan Worker failed.', [
+                'job_id' => (string) $job['id'],
+                'exception_class' => $throwable::class,
+                'error_code' => $code,
+            ]),
+            'Failed-scan terminal log could not be written.',
+            $failureContext,
+        );
     }
 
     /** Restores pre-existing scan readiness after cancellation without changing media counts. */

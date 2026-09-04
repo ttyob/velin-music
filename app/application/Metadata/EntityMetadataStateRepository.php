@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\Metadata;
 
+use app\application\Artist\ArtistNameIdentityNormalizer;
 use app\application\Search\SearchTextNormalizer;
 use stdClass;
 use Symfony\Component\Uid\Ulid;
@@ -21,6 +22,8 @@ final class EntityMetadataStateRepository
     public function __construct(
         private readonly EntityMetadataFieldSchema $schema = new EntityMetadataFieldSchema(),
         private readonly SearchTextNormalizer $normalizer = new SearchTextNormalizer(),
+        private readonly MetadataScrapePolicyService $policy = new MetadataScrapePolicyService(),
+        private readonly ArtistNameIdentityNormalizer $artistNames = new ArtistNameIdentityNormalizer(),
     ) {
     }
 
@@ -43,7 +46,10 @@ final class EntityMetadataStateRepository
             Db::table($table)->insertOrIgnore([
                 $idColumn => $entityId, 'field_key' => $field,
                 'raw_value_json' => $this->encode($value), 'scraped_value_json' => null,
-                'manual_value_json' => null, 'effective_value_json' => $this->encode($value),
+                'manual_value_json' => null,
+                'effective_value_json' => $this->encode($this->policy->effectiveValue(
+                    $this->policyField($type, $field), $value,
+                )),
                 'effective_source' => 'raw', 'is_locked' => 0, 'version' => 1,
                 'source_updated_at' => $now, 'manual_updated_at' => null, 'updated_by' => null,
                 'created_at' => $now, 'updated_at' => $now,
@@ -56,8 +62,9 @@ final class EntityMetadataStateRepository
      * 从一次已确认扫描同步完整 raw 与稀疏 scraped 来源。
      *
      * `raw` 必须包含类型全部字段；`scraped` 只含第三方实际提供的字段，缺失表示该来源消失。锁定字段
-     * 仍更新两份来源事实和版本，但保持 effective 不变；未锁定字段按 manual > raw > scraped 重算。
-     * 调用结束会重新物化实体，确保扫描不能覆盖人工值。
+     * 仍更新两份来源事实和版本，但保持 effective 不变；未锁定字段默认按 manual > raw > scraped 重算，
+     * 专辑标题和发行日期按 manual/locked > scraped > raw 重算。调用结束会重新物化实体，确保扫描不能
+     * 覆盖人工值，同时也不会把已确认的专辑事实压回文件标签。
      *
      * @param array<string,mixed> $raw
      * @param array<string,mixed> $scraped
@@ -90,8 +97,13 @@ final class EntityMetadataStateRepository
                     $values['effective_source'] = 'manual';
                 } else {
                     $rawPresent = $this->valuePresent($rawValue, $field);
-                    $values['effective_value_json'] = $rawPresent || $scrapedJson === null ? $rawJson : $scrapedJson;
-                    $values['effective_source'] = $rawPresent || $scrapedJson === null ? 'raw' : 'scraped';
+                    $scrapedWins = $scrapedJson !== null
+                        && ($this->policy->providerOverridesMetadata($this->policyField($type, $field)) || !$rawPresent);
+                    $selected = $scrapedWins ? $scrapedValue : $rawValue;
+                    $values['effective_value_json'] = $this->encode($this->policy->effectiveValue(
+                        $this->policyField($type, $field), $selected,
+                    ));
+                    $values['effective_source'] = $scrapedWins ? 'scraped' : 'raw';
                 }
             }
             Db::table($table)->where($idColumn, $entityId)->where('field_key', $field)->update($values);
@@ -102,9 +114,11 @@ final class EntityMetadataStateRepository
     /**
      * 应用一次已验证的稀疏第三方实体字段。
      *
-     * 专辑属于共享实体，歌曲刮削必须先保存歌曲来源，再通过本方法按字段补齐专辑信息。手工值和已有
-     * 原始值只记录第三方事实但保持有效投影不变；只有字段确实为空时才把 scraped 提升为 effective，
-     * 并在同一调用内物化专辑关系。调用方负责外层授权、歌曲证据和事务。
+     * 专辑属于共享实体，歌曲刮削必须先保存歌曲来源，再通过本方法按字段补齐专辑信息。每个未锁定、
+     * 无 manual 的字段都按当前策略重新选择 raw/scraped，并再次执行业务文本投影；即使 raw 继续获胜，
+     * 也必须让新开启的繁转简作用于 effective，不能把设置变更前的投影永久保留。raw/scraped 来源原文
+     * 不改变，manual 和 locked 仍拥有最高优先级，并在同一调用内物化专辑关系。调用方负责外层授权、
+     * 歌曲证据和事务。
      * @param array<string,mixed> $candidate 只包含专辑实体白名单字段
      */
     public function applyScrapedCandidate(string $type, string $entityId, array $candidate, string $now): void
@@ -123,15 +137,66 @@ final class EntityMetadataStateRepository
             if (!$existing instanceof stdClass || (int) $existing->is_locked === 1) continue;
             $values = ['scraped_value_json' => $this->encode($value), 'version' => Db::raw('version + 1'),
                 'source_updated_at' => $now, 'updated_at' => $now];
-            if ($existing->manual_value_json === null
-                && !$this->valuePresent($this->decode((string) $existing->raw_value_json), $field)) {
-                $values['effective_value_json'] = $this->encode($value);
-                $values['effective_source'] = 'scraped';
+            if ($existing->manual_value_json === null) {
+                $rawValue = $this->decode((string) $existing->raw_value_json);
+                $policyField = $this->policyField($type, $field);
+                $scrapedWins = $this->policy->providerOverridesMetadata($policyField)
+                    || !$this->valuePresent($rawValue, $field);
+                $selected = $scrapedWins ? $value : $rawValue;
+                $values['effective_value_json'] = $this->encode($this->policy->effectiveValue(
+                    $policyField, $selected,
+                ));
+                $values['effective_source'] = $scrapedWins ? 'scraped' : 'raw';
             }
             Db::table($table)->where($idColumn, $entityId)->where('field_key', $field)
                 ->where('version', (int) $existing->version)->update($values);
         }
         $this->materialize($type, $entityId, $now);
+    }
+
+    /**
+     * 依据当前全局策略重算一个共享实体的未锁定自动来源。
+     *
+     * 调用方负责权限和短事务。本方法不合并实体，也不修改 raw/scraped/manual/locked 事实；只对自动字段
+     * 重新选择来源并执行业务文本投影，真实变化使用字段版本 CAS。艺术家简化后若与另一稳定实体规范名
+     * 冲突会失败关闭，要求管理员走合并工作流；整个当前批次由上层回滚，不进行名称猜测。重复执行没有
+     * 变化时仍物化现有有效值，以修复旧目录投影，但不推进字段版本。
+     *
+     * @return int 实际改变有效值或来源的字段数
+     */
+    public function reprojectAutomaticValues(string $type, string $entityId, string $now): int
+    {
+        [$table, $idColumn] = $this->storage($type);
+        if (!Db::connection()->getSchemaBuilder()->hasTable($table)) return 0;
+        $this->ensure($type, $entityId, $now);
+        $changedFields = 0;
+        /** @var list<stdClass> $rows */
+        $rows = Db::table($table)->where($idColumn, $entityId)->orderBy('field_key')->get()->all();
+        foreach ($rows as $row) {
+            if ((int) $row->is_locked === 1 || $row->manual_value_json !== null) continue;
+            $field = (string) $row->field_key;
+            $raw = $this->decode((string) $row->raw_value_json);
+            $scraped = $row->scraped_value_json === null ? null : $this->decode((string) $row->scraped_value_json);
+            $policyField = $this->policyField($type, $field);
+            $scrapedWins = $row->scraped_value_json !== null
+                && ($this->policy->providerOverridesMetadata($policyField) || !$this->valuePresent($raw, $field));
+            $source = $scrapedWins ? 'scraped' : 'raw';
+            $effectiveJson = $this->encode($this->policy->effectiveValue(
+                $policyField,
+                $scrapedWins ? $scraped : $raw,
+            ));
+            if ((string) $row->effective_source === $source
+                && (string) $row->effective_value_json === $effectiveJson) continue;
+            $changed = Db::table($table)->where($idColumn, $entityId)->where('field_key', $field)
+                ->where('version', (int) $row->version)->update([
+                    'effective_value_json' => $effectiveJson, 'effective_source' => $source,
+                    'version' => Db::raw('version + 1'), 'source_updated_at' => $now, 'updated_at' => $now,
+                ]);
+            if ($changed !== 1) throw new MediaMetadataConflict('实体字段在策略重投影期间发生变化。');
+            ++$changedFields;
+        }
+        $this->materialize($type, $entityId, $now);
+        return $changedFields;
     }
 
     /** @return array<string,array<string,mixed>> 返回解码后的安全字段状态，不包含路径或标签原始映射。 */
@@ -172,8 +237,9 @@ final class EntityMetadataStateRepository
         $external = is_array($value('externalIds')) ? $value('externalIds') : [];
         if ($type === 'artist') {
             $name = (string) $value('name');
-            $normalized = $this->normalizer->normalize($name);
-            if (Db::table('media_artists')->where('normalized_name', $normalized)->where('id', '!=', $entityId)->exists()) {
+            $normalized = $this->artistNames->storageKey($name);
+            if (Db::table('media_artists')->whereIn('normalized_name', $this->artistNames->lookupKeys($name))
+                ->where('id', '!=', $entityId)->exists()) {
                 throw new MediaMetadataConflict('艺术家名称已由其他实体使用，请使用合并工作流。');
             }
             Db::table('media_artists')->where('id', $entityId)->update([
@@ -248,8 +314,9 @@ final class EntityMetadataStateRepository
     {
         Db::table('media_album_artists')->where('album_id', $albumId)->delete();
         foreach ($names as $position => $name) {
-            $normalized = $this->normalizer->normalize($name);
-            $artistId = Db::table('media_artists')->where('normalized_name', $normalized)->value('id');
+            $normalized = $this->artistNames->storageKey($name);
+            $artistId = Db::table('media_artists')->whereIn('normalized_name', $this->artistNames->lookupKeys($name))
+                ->orderBy('created_at')->orderBy('id')->value('id');
             if (!is_string($artistId)) $artistId = $this->artistIdByRawName($name);
             if (!is_string($artistId)) {
                 $artistId = (string) new Ulid();
@@ -271,6 +338,21 @@ final class EntityMetadataStateRepository
             'artist' => ['media_artist_metadata_field_states', 'artist_id'],
             'album' => ['media_album_metadata_field_states', 'album_id'],
             default => throw new MediaMetadataInvalid('不支持的元数据实体类型。'),
+        };
+    }
+
+    /**
+     * 把共享实体字段映射到与歌曲字段共用的配置项，避免出现两套优先级。
+     *
+     * 艺术家排序名没有独立管理开关，必须跟随 `artists`；否则历史重投影或第三方返回 sortName 时会把
+     * 实体内部字段误当成公开策略键并失败。专辑排序名已有对应的 `sortTitle`，继续保持独立配置语义。
+     */
+    private function policyField(string $type, string $field): string
+    {
+        return match (true) {
+            $type === 'artist' && in_array($field, ['name', 'sortName'], true) => 'artists',
+            $type === 'album' && $field === 'title' => 'album',
+            default => $field,
         };
     }
 

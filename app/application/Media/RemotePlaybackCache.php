@@ -34,6 +34,11 @@ final readonly class RemotePlaybackCache
         private int $ttlSeconds = self::DEFAULT_TTL_SECONDS,
     ) {
         $runtime = (string) (getenv('VELIN_RUNTIME_PATH') ?: base_path('runtime'));
+        // Docker 用 `/app/runtime` 指向固定的 `/data/runtime`；先解析运行时根，才能让后续缓存目录的
+        // 真实路径校验比较同一套字符串。环境变量不存在、目标尚未创建或 realpath 失败时保留原值，
+        // 由 directory() 在创建/读取边界统一失败关闭，不把任意路径转换成可写缓存根。
+        $resolvedRuntime = realpath($runtime);
+        if (is_string($resolvedRuntime)) $runtime = $resolvedRuntime;
         $this->root = $root ?? rtrim($runtime, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'remote-playback-cache';
     }
 

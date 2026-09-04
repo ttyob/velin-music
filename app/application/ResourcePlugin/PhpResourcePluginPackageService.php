@@ -40,8 +40,15 @@ final readonly class PhpResourcePluginPackageService
     ) {
     }
 
-    /** @return array{pluginKey:string,databaseVersion:int,status:string,restartRequired:bool} */
-    public function install(string $archivePath, string $uploadName, string $actorId, string $requestId): array
+    /**
+     * 安装或升级一个已经落在服务端临时区或镜像受信目录的插件 ZIP。
+     *
+     * actorId 仅允许容器默认插件初始化传 null；HTTP 管理入口始终传入已鉴权管理员。两种来源执行完全相同
+     * 的包校验、数据库事务和审计，系统安装只把审计 actor 保持为空，不获得绕过版本或路径规则的能力。
+     *
+     * @return array{pluginKey:string,databaseVersion:int,status:string,restartRequired:bool}
+     */
+    public function install(string $archivePath, string $uploadName, ?string $actorId, string $requestId): array
     {
         if (pathinfo($uploadName, PATHINFO_EXTENSION) !== 'zip' || !is_file($archivePath)
             || is_link($archivePath) || ($size = filesize($archivePath)) === false
@@ -303,7 +310,12 @@ final readonly class PhpResourcePluginPackageService
 
     private function ensureRoot(): string
     {
-        $root = rtrim($this->root ?? base_path('plugin'), DIRECTORY_SEPARATOR);
+        // 镜像把只读应用入口 `/app/plugin` 固定链接到持久化 `/data/plugins`；默认入口由部署镜像控制，
+        // 因而先解析为真实目录再执行可写性检查。测试或调用方显式传入的根仍不得是链接，避免插件包
+        // 安装被重定向到未授权位置；解析或创建失败时不写暂存文件，也不改变插件迁移账本。
+        $defaultRoot = base_path('plugin');
+        $root = $this->root ?? (realpath($defaultRoot) ?: $defaultRoot);
+        $root = rtrim($root, DIRECTORY_SEPARATOR);
         if ($root === '' || $root[0] !== DIRECTORY_SEPARATOR || is_link($root)) {
             throw new PhpResourcePluginPackageUnavailable();
         }

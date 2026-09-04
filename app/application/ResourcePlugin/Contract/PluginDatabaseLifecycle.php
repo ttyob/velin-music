@@ -7,7 +7,7 @@ namespace app\application\ResourcePlugin\Contract;
 /**
  * PluginDatabaseLifecycle 定义 PHP 插件数据库结构与初始数据的安装、升级和卸载合同。
  *
- * databaseVersion 必须单调递增；核心在同一数据库事务中调用 install 并更新插件迁移账本，因此 DDL、
+ * databaseVersion 通常必须单调递增；声明 PluginDatabaseBaselineCollapse 的发布基线允许一次性收敛已验证的历史账本。核心在同一数据库事务中调用 install 并更新插件迁移账本，因此 DDL、
  * 初始化数据和版本记录要么一起提交，要么一起回滚。uninstall 是显式破坏性操作，调用前必须停止对应
  * 插件 Worker 并使用精确确认词；实现按外键逆序删除插件数据和表，不得删除音乐库、用户、媒体或核心
  * 审计表。外部系统中的任务不属于数据库事务，插件必须在文档中说明残留和人工清理条件。

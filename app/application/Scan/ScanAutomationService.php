@@ -39,7 +39,7 @@ final readonly class ScanAutomationService
      * 返回当前应由 helper 监听的本地库启动快照。
      *
      * 物理路径只在自动化 Worker 内传给 stdin 协议，不写日志、审计或任务。查询不探测目录；helper 会
-     * 在添加 inotify watch 前重新验证 `/media` 包含关系和真实路径身份。
+     * 在添加 inotify watch 前重新验证 `/storage/music` 包含关系和真实路径身份。
      *
      * @return list<array{key:string,root:string}>
      */

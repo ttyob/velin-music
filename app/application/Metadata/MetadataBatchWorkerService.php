@@ -6,6 +6,9 @@ namespace app\application\Metadata;
 
 use app\application\Auth\CapabilityResolver;
 use app\infrastructure\Audit\AuditLogger;
+use app\infrastructure\Database\SqliteTransientRetry;
+use app\infrastructure\Database\SqliteWriteGate;
+use Closure;
 use JsonException;
 use stdClass;
 use Symfony\Component\Uid\Ulid;
@@ -28,18 +31,26 @@ final class MetadataBatchWorkerService
         private readonly MetadataFieldStateRepository $states = new MetadataFieldStateRepository(),
         private readonly CapabilityResolver $capabilities = new CapabilityResolver(),
         private readonly AuditLogger $audit = new AuditLogger(),
+        private readonly SqliteTransientRetry $sqliteRetry = new SqliteTransientRetry(),
+        private readonly SqliteWriteGate $sqliteWriteGate = new SqliteWriteGate(),
     ) {
     }
 
-    /** 恢复崩溃租约；最多三次，耗尽后把所有未完成目标记为稳定失败。 */
+    /**
+     * 恢复崩溃租约；最多三次，耗尽后把所有未完成目标记为稳定失败。
+     *
+     * 预筛选读取和逐方案 CAS 都只访问数据库短边界；SQLite 瞬时 BUSY/LOCKED 由有界重试吸收，租约
+     * 心跳条件保证重放不会接管已经续租的方案。这里不执行媒体、网络或文件操作，重试失败会继续向
+     * Worker 冒泡，保留下一轮租约恢复的可观测性。
+     */
     public function recoverStaleLeases(): void
     {
         $threshold = gmdate('Y-m-d\TH:i:s\Z', time() - self::LEASE_SECONDS);
         /** @var list<stdClass> $rows */
-        $rows = Db::table('metadata_batch_plans')->where('status', 'running')
+        $rows = $this->sqliteRetry->run(fn (): array => Db::table('metadata_batch_plans')->where('status', 'running')
             ->where(fn ($query) => $query->whereNull('heartbeat_at')->orWhere('heartbeat_at', '<', $threshold))
-            ->get(['id', 'attempt', 'heartbeat_at'])->all();
-        foreach ($rows as $row) Db::transaction(function () use ($row): void {
+            ->get(['id', 'attempt', 'heartbeat_at'])->all());
+        foreach ($rows as $row) $this->writeTransaction(function () use ($row): void {
             $query = Db::table('metadata_batch_plans')->where('id', (string) $row->id)->where('status', 'running');
             $row->heartbeat_at === null ? $query->whereNull('heartbeat_at') : $query->where('heartbeat_at', (string) $row->heartbeat_at);
             $now = gmdate('Y-m-d\TH:i:s\Z');
@@ -65,10 +76,18 @@ final class MetadataBatchWorkerService
         });
     }
 
-    /** @return array<string,mixed>|null 条件更新获胜时返回方案不可变执行输入。 */
+    /**
+     * 条件领取最早的排队方案，并返回其不可变执行输入。
+     *
+     * 查询、状态 CAS 和父任务推进位于同一个短事务；SQLite 瞬时锁竞争从事务边界有界重放，只有条件
+     * 更新获胜者可以执行方案。该方法不做外部调用，事务回滚不会留下半领取状态；重试耗尽或永久错误
+     * 原样抛出，由进程级 tick 记录并在下一轮恢复。
+     *
+     * @return array<string,mixed>|null
+     */
     public function claimNext(string $workerId): ?array
     {
-        return Db::transaction(function () use ($workerId): ?array {
+        return $this->writeTransaction(function () use ($workerId): ?array {
             /** @var stdClass|null $row */
             $row = Db::table('metadata_batch_plans')->where('status', 'queued')->orderBy('created_at')->orderBy('id')
                 ->first(['id', 'requested_by', 'request_id', 'operations_json', 'target_count']);
@@ -94,16 +113,20 @@ final class MetadataBatchWorkerService
             while (true) {
                 if ($isStopping()) { $this->release($planId); return; }
                 /** @var stdClass|null $target */
-                $target = Db::table('metadata_batch_targets')->where('plan_id', $planId)->where('status', 'pending')
-                    ->orderBy('song_id')->first(['song_id', 'library_id', 'field_versions_json']);
+                $target = $this->sqliteRetry->run(fn (): ?stdClass => Db::table('metadata_batch_targets')
+                    ->where('plan_id', $planId)->where('status', 'pending')
+                    ->orderBy('song_id')->first(['song_id', 'library_id', 'field_versions_json']));
                 if (!$target instanceof stdClass) break;
                 try {
                     $this->executeTarget($plan, $target, $operations);
                 } catch (Throwable $throwable) {
                     $this->failTarget($planId, (string) $target->song_id, $this->errorCode($throwable));
                 }
-                Db::table('metadata_batch_plans')->where('id', $planId)->where('status', 'running')
-                    ->update(['heartbeat_at' => gmdate('Y-m-d\TH:i:s\Z'), 'updated_at' => gmdate('Y-m-d\TH:i:s\Z')]);
+                $this->writeTransaction(function () use ($planId): void {
+                    $now = gmdate('Y-m-d\TH:i:s\Z');
+                    Db::table('metadata_batch_plans')->where('id', $planId)->where('status', 'running')
+                        ->update(['heartbeat_at' => $now, 'updated_at' => $now]);
+                });
             }
             $this->finish($plan);
         } catch (Throwable) {
@@ -115,7 +138,7 @@ final class MetadataBatchWorkerService
     /** @param list<array<string,mixed>> $operations */
     private function executeTarget(array $plan, stdClass $target, array $operations): void
     {
-        Db::transaction(function () use ($operations, $plan, $target): void {
+        $this->writeTransaction(function () use ($operations, $plan, $target): void {
             $planId = (string) $plan['id']; $songId = (string) $target->song_id;
             $now = gmdate('Y-m-d\TH:i:s\Z');
             $claimed = Db::table('metadata_batch_targets')->where('plan_id', $planId)->where('song_id', $songId)
@@ -185,7 +208,7 @@ final class MetadataBatchWorkerService
 
     private function failTarget(string $planId, string $songId, string $errorCode): void
     {
-        Db::transaction(function () use ($errorCode, $planId, $songId): void {
+        $this->writeTransaction(function () use ($errorCode, $planId, $songId): void {
             $now = gmdate('Y-m-d\TH:i:s\Z');
             $updated = Db::table('metadata_batch_targets')->where('plan_id', $planId)->where('song_id', $songId)
                 ->whereIn('status', ['pending', 'running'])->update(['status' => 'failed', 'error_code' => $errorCode,
@@ -199,7 +222,7 @@ final class MetadataBatchWorkerService
 
     private function finish(array $plan): void
     {
-        Db::transaction(function () use ($plan): void {
+        $this->writeTransaction(function () use ($plan): void {
             /** @var stdClass|null $row */
             $row = Db::table('metadata_batch_plans')->where('id', (string) $plan['id'])->where('status', 'running')
                 ->first(['succeeded_count', 'failed_count']);
@@ -219,7 +242,7 @@ final class MetadataBatchWorkerService
 
     private function release(string $planId): void
     {
-        Db::transaction(function () use ($planId): void {
+        $this->writeTransaction(function () use ($planId): void {
             $now = gmdate('Y-m-d\TH:i:s\Z');
             if (Db::table('metadata_batch_plans')->where('id', $planId)->where('status', 'running')->update([
                 'status' => 'queued', 'worker_id' => null, 'heartbeat_at' => null, 'updated_at' => $now,
@@ -230,7 +253,7 @@ final class MetadataBatchWorkerService
 
     private function finishInfrastructureFailure(array $plan): void
     {
-        Db::transaction(function () use ($plan): void {
+        $this->writeTransaction(function () use ($plan): void {
             $now = gmdate('Y-m-d\TH:i:s\Z');
             $remaining = Db::table('metadata_batch_targets')->where('plan_id', (string) $plan['id'])
                 ->whereIn('status', ['pending', 'running'])->update([
@@ -306,5 +329,24 @@ final class MetadataBatchWorkerService
             $throwable instanceof MediaMetadataInvalid, $throwable instanceof JsonException => 'METADATA_OPERATION_INVALID',
             default => 'METADATA_BATCH_INTERNAL_FAILED',
         };
+    }
+
+    /**
+     * 在 SQLite 写入闸门内重试一个短事务。
+     *
+     * 批量方案的领取、单目标提交、失败收口和租约恢复都只包含数据库读写，且依赖状态 CAS、唯一键和
+     * 目标 ID 具备幂等重放条件，因此可以在 BUSY/LOCKED 时从事务边界重新执行。这里不能包住整个方案
+     * 执行或任何外部网络/文件操作；重试耗尽、永久约束错误和锁文件不可用都原样向上抛出，由 Worker
+     * 按现有方案级失败状态收口，避免把真实故障伪装成成功。
+     *
+     * @template T
+     * @param Closure(): T $operation
+     * @return T
+     */
+    private function writeTransaction(Closure $operation): mixed
+    {
+        return $this->sqliteRetry->run(
+            fn (): mixed => $this->sqliteWriteGate->run(static fn (): mixed => Db::transaction($operation)),
+        );
     }
 }

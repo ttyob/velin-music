@@ -21,6 +21,7 @@ use app\application\Playlist\PlaylistCoverService;
 use app\application\Playlist\PlaylistNotFound;
 use app\application\System\SystemLimitSettingsService;
 use app\http\ByteRangeParser;
+use app\http\LocalFileResponseFactory;
 use app\http\MediaSourceResponseFactory;
 use app\http\UnsatisfiableByteRange;
 use RuntimeException;
@@ -28,17 +29,16 @@ use support\Request;
 use support\Response;
 
 /**
- * Produces raw Subsonic audio/download/artwork responses after salt-token authentication.
+ * 在盐值 token 认证后生成 Subsonic 音频、下载和图片原始响应。
  *
- * The service reuses the Web file resolvers, including current library grants, canonical-root
- * containment, symlink/mount defense, and complete scan-time file identity checks. Physical paths
- * remain only in Workerman's internal file descriptor. Source delivery never increments plays.
- * Transcoding is delegated to a bounded non-blocking FFmpeg supervisor; unsupported transformations
- * fail explicitly rather than silently violating client negotiation.
+ * 服务复用 Web 端文件解析器，包括实时音乐库授权、规范根约束、符号链接/挂载防护和扫描期完整文件身份
+ * 校验。本地物理路径仅进入 Go 加密投递描述或 Workerman 内部文件响应，不向客户端公开；发送源文件不会
+ * 增加播放次数。转码交给有并发上限的非阻塞 FFmpeg supervisor，不支持的变换会显式失败，不能静默偏离
+ * 客户端协商结果。
  */
 final readonly class SubsonicMediaService
 {
-    /** Shares existing authorization-safe file resolvers and the tested single-range parser. */
+    /** 复用已有授权安全的文件解析器和经过测试的单区间 Range 解析器。 */
     public function __construct(
         private MediaStreamService $streams = new MediaStreamService(),
         private ArtworkService $artwork = new ArtworkService(),
@@ -143,7 +143,13 @@ final readonly class SubsonicMediaService
             return response('', 304, $headers);
         }
 
-        return response('', 200, $headers)->withFile($artwork->path);
+        return (new LocalFileResponseFactory())->create(
+            $artwork->path,
+            200,
+            $headers,
+            0,
+            $artwork->fileSize,
+        );
     }
 
     /**
@@ -279,7 +285,7 @@ final readonly class SubsonicMediaService
         return response($bytes, 200, $headers);
     }
 
-    /** Builds a full or one-range Workerman file response without buffering audio in PHP. */
+    /** 构造完整或单区间源文件响应；本地文件优先由 Go 发送，PHP 不缓冲音频正文。 */
     private function audioResponse(
         Request $request,
         PlayableMedia $media,
@@ -314,7 +320,7 @@ final readonly class SubsonicMediaService
         );
     }
 
-    /** Resolves one strict song ID and maps hidden/stale rows to protocol not-found. */
+    /** 解析严格歌曲 ID，并把不可见或失效记录统一映射为协议 not-found。 */
     private function resolveSong(array $actor, mixed $songId): PlayableMedia
     {
         $songId = $this->requiredId($songId);
@@ -327,7 +333,7 @@ final readonly class SubsonicMediaService
         }
     }
 
-    /** Builds private audio cache headers and an RFC 5987 UTF-8 download filename. */
+    /** 构造私有音频缓存头和符合 RFC 5987 的 UTF-8 下载文件名。 */
     private function audioHeaders(PlayableMedia $media, string $requestId, bool $attachment): array
     {
         return [
@@ -362,7 +368,7 @@ final readonly class SubsonicMediaService
         ];
     }
 
-    /** Applies If-None-Match precedence followed by second-granularity date validation. */
+    /** 按协议优先校验 If-None-Match，再按秒精度校验日期验证器。 */
     private function isNotModified(Request $request, string $etag, int $modifiedAt): bool
     {
         $ifNoneMatch = trim((string) $request->header('if-none-match', ''));
@@ -381,7 +387,7 @@ final readonly class SubsonicMediaService
         return $date !== false && $modifiedAt <= $date;
     }
 
-    /** Uses Range only while optional If-Range still strongly identifies the selected source. */
+    /** 仅在可选 If-Range 仍能强校验当前源文件时采用 Range。 */
     private function ifRangeMatches(Request $request, string $etag, int $modifiedAt): bool
     {
         $ifRange = trim((string) $request->header('if-range', ''));
@@ -396,7 +402,7 @@ final readonly class SubsonicMediaService
         return $date !== false && $modifiedAt <= $date;
     }
 
-    /** Parses one bounded non-negative canonical decimal parameter. */
+    /** 解析一个有上限、非负且使用规范十进制形式的参数。 */
     private function integer(mixed $value, int $minimum, int $maximum, string $label): int
     {
         if (is_int($value)) {
@@ -413,7 +419,7 @@ final readonly class SubsonicMediaService
         return $integer;
     }
 
-    /** Rejects missing, array, path-like, or malformed opaque media IDs before a file query. */
+    /** 在文件查询前拒绝缺失、数组、类路径或格式错误的不透明媒体 ID。 */
     private function requiredId(mixed $value): string
     {
         if (!is_string($value) || preg_match('/^[0-9A-HJKMNP-TV-Z]{26}$/', $value) !== 1) {
@@ -450,7 +456,7 @@ final readonly class SubsonicMediaService
         throw new SubsonicRequestInvalid('A required artwork ID is missing or invalid.');
     }
 
-    /** Enforces the global operation capability in addition to live library grants. */
+    /** 在实时音乐库授权之外继续强制全局操作能力。 */
     private function requireCapability(array $actor, string $capability): void
     {
         $capabilities = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];

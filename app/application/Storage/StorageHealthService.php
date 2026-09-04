@@ -7,13 +7,11 @@ namespace app\application\Storage;
 use app\application\Auth\AuthorizationDenied;
 
 /**
- * Inspects only Velin's registered container roots and fixed worker binaries (ADMIN-STORAGE-001).
+ * 只检查 Velin 登记的容器目录和固定 Worker 二进制（ADMIN-STORAGE-001）。
  *
- * No request value can select a path or command. Directory probes use metadata, capacity, and mount
- * tables only; they never enumerate media files, create missing directories, or open content. Binary
- * probes execute a fixed `-version` argument with a two-second ceiling and discard output. The result
- * may expose registered paths because callers must hold `manage_storage`; overview consumers should
- * use `summary()` to omit paths and device identifiers.
+ * 请求参数不能选择路径或命令。目录探针只读取元数据、容量和挂载表，不枚举媒体文件、不创建目录，也不
+ * 打开内容；二进制探针只执行固定 `-version` 参数，两秒超时后终止并丢弃输出。详细结果包含登记路径，
+ * 因而调用方必须具有 `manage_storage`；概览只能调用 `summary()`，不得泄露路径和设备身份。
  */
 final class StorageHealthService
 {
@@ -27,18 +25,21 @@ final class StorageHealthService
     private array $binaries;
 
     /**
-     * Production uses the fixed registry; tests may inject temporary roots without changing API input.
+     * 生产环境使用固定登记表和真实容量探针；测试可以注入临时根及确定性容量，但不能改变 HTTP 输入边界。
      *
      * @param list<array{key: string, path: string, required: bool, writeRequired: bool}>|null $roots
      * @param array<string, string>|null $binaries
      */
-    public function __construct(?array $roots = null, ?array $binaries = null)
-    {
+    public function __construct(
+        ?array $roots = null,
+        ?array $binaries = null,
+        private StorageCapacityProbe $capacityProbe = new StorageCapacityProbe(),
+    ) {
         $databasePath = (string) (getenv('VELIN_DB_PATH') ?: base_path('database/velin.sqlite'));
         $runtimePath = rtrim((string) (getenv('VELIN_RUNTIME_PATH') ?: base_path('runtime')), DIRECTORY_SEPARATOR);
-        $scrapeCachePath = rtrim((string) (getenv('VELIN_SCRAPE_CACHE_PATH') ?: '/media/cache/scrape'), DIRECTORY_SEPARATOR);
+        $scrapeCachePath = StorageLayout::SCRAPE_CACHE_ROOT;
         $this->roots = $roots ?? [
-            ['key' => 'library', 'path' => '/media/library', 'required' => true, 'writeRequired' => false],
+            ['key' => 'library', 'path' => StorageLayout::LIBRARY_ROOT, 'required' => true, 'writeRequired' => false],
             ['key' => 'scrapeCache', 'path' => $scrapeCachePath, 'required' => true, 'writeRequired' => true],
             ['key' => 'transcodeCache', 'path' => $runtimePath . '/transcode-spool', 'required' => false, 'writeRequired' => true],
             ['key' => 'uploadStaging', 'path' => $runtimePath . '/uploads', 'required' => false, 'writeRequired' => true],
@@ -130,10 +131,11 @@ final class StorageHealthService
         $writable = $exists && is_writable($root['path']);
         $realPath = $exists ? realpath($root['path']) : false;
         $stat = $exists ? @stat($root['path']) : false;
-        $total = $readable ? @disk_total_space($root['path']) : false;
-        $free = $readable ? @disk_free_space($root['path']) : false;
-        $freeRatio = is_float($total) && $total > 0 && is_float($free) ? $free / $total : null;
-        $inode = $readable ? $this->inodeCapacity($root['path']) : null;
+        $capacity = $readable ? $this->capacityProbe->bytes($root['path']) : null;
+        $total = $capacity['total'] ?? null;
+        $free = $capacity['free'] ?? null;
+        $freeRatio = is_int($total) && $total > 0 && is_int($free) ? $free / $total : null;
+        $inode = $readable ? $this->capacityProbe->inodes($root['path']) : null;
         $inodeRatio = is_array($inode) && $inode['total'] > 0 ? $inode['free'] / $inode['total'] : null;
         $mount = is_string($realPath) ? $this->mountFor($realPath, $mounts) : null;
 
@@ -151,7 +153,7 @@ final class StorageHealthService
         } elseif ($freeRatio !== null && $freeRatio * 100 < (int) $policy['criticalFreePercent']) {
             $reason = 'SPACE_CRITICAL';
             $status = 'critical';
-        } elseif (is_float($free) && $free <= (int) $policy['safetyReserveBytes']) {
+        } elseif (is_int($free) && $free <= (int) $policy['safetyReserveBytes']) {
             $reason = 'SAFETY_RESERVE_REACHED';
             $status = 'critical';
         } elseif ($inodeRatio !== null && $inodeRatio * 100 < (int) $policy['criticalFreePercent']) {
@@ -190,8 +192,8 @@ final class StorageHealthService
             'deviceId' => is_array($stat) ? (string) $stat['dev'] : null,
             'mountPoint' => $mount['mountPoint'] ?? null,
             'filesystemType' => $mount['filesystemType'] ?? null,
-            'totalBytes' => is_float($total) ? (int) $total : null,
-            'freeBytes' => is_float($free) ? (int) $free : null,
+            'totalBytes' => $total,
+            'freeBytes' => $free,
             'freePercent' => $freeRatio === null ? null : round($freeRatio * 100, 1),
             'totalInodes' => $inode['total'] ?? null,
             'freeInodes' => $inode['free'] ?? null,
@@ -271,36 +273,6 @@ final class StorageHealthService
         $right = rtrim($right, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
 
         return $left !== $right && !str_starts_with($left, $right) && !str_starts_with($right, $left);
-    }
-
-    /** Reads inode capacity through fixed argv `df`; no shell or untrusted argument is involved. */
-    private function inodeCapacity(string $path): ?array
-    {
-        if (!function_exists('proc_open') || !is_executable('/bin/df')) {
-            return null;
-        }
-        $pipes = [];
-        $process = @proc_open(['/bin/df', '-Pi', $path], [
-            0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'],
-        ], $pipes);
-        if (!is_resource($process)) {
-            return null;
-        }
-        fclose($pipes[0]);
-        $output = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $exit = proc_close($process);
-        if ($exit !== 0 || !is_string($output)) {
-            return null;
-        }
-        $lines = array_values(array_filter(array_map('trim', preg_split('/\R/', $output) ?: [])));
-        $fields = preg_split('/\s+/', (string) end($lines)) ?: [];
-        if (count($fields) < 6 || !ctype_digit($fields[1]) || !ctype_digit($fields[3])) {
-            return null;
-        }
-
-        return ['total' => (int) $fields[1], 'free' => (int) $fields[3]];
     }
 
     /** Parses Linux mountinfo and returns only mount point/filesystem identity for longest-prefix match. */

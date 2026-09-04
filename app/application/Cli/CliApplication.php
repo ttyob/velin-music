@@ -12,7 +12,13 @@ use app\application\Dlna\DlnaUnavailable;
 use app\application\Library\LibraryAccessResolver;
 use app\application\Scan\ScanCreateInput;
 use app\application\Scan\ScanJobService;
+use app\application\ResourcePlugin\InitialPluginPackageService;
 use app\application\ResourcePlugin\PhpResourcePluginPackageService;
+use app\application\Metadata\MetadataPolicyReprojectionService;
+use app\application\Metadata\MetadataPolicyReprojectionBusy;
+use app\application\Metadata\MetadataScrapePolicyConflict;
+use app\application\Metadata\MetadataScrapePolicyUnavailable;
+use app\application\System\SqliteBackupService;
 use InvalidArgumentException;
 use stdClass;
 use support\Db;
@@ -37,9 +43,12 @@ final class CliApplication
                 'help' => $this->help(),
                 'database:check' => $this->databaseCheck(),
                 'system:status' => $this->systemStatus(),
+                'backup:create' => $this->createBackup($parsed['options']),
+                'plugin:initialize-defaults' => $this->initializeDefaultPlugins($parsed['options']),
                 'plugin:finalize-pending' => $this->finalizePendingPlugins($parsed['options']),
                 'scan:create' => $this->createScan($parsed['options']),
                 'artist-profile:refresh-all' => $this->refreshAllArtistProfiles($parsed['options']),
+                'metadata-policy:reproject' => $this->reprojectMetadataPolicy($parsed['options']),
                 'user:reset-password' => $this->resetPassword($parsed['options']),
                 'dlna:devices' => $this->dlnaDevices($parsed['options']),
                 'dlna:play' => $this->dlnaPlay($parsed['options']),
@@ -59,6 +68,9 @@ final class CliApplication
         } catch (DlnaUnavailable) {
             fwrite(STDERR, 'Velin CLI: 当前状态不满足命令执行条件，请重新检查状态和版本。' . PHP_EOL);
             return 2;
+        } catch (MetadataPolicyReprojectionBusy|MetadataScrapePolicyConflict|MetadataScrapePolicyUnavailable) {
+            fwrite(STDERR, 'Velin CLI: 元数据策略重投影当前不可执行，请等待活动任务结束并检查策略版本。' . PHP_EOL);
+            return 2;
         } catch (Throwable $failure) {
             fwrite(STDERR, 'Velin CLI: 命令未执行，错误码 CLI_OPERATION_FAILED。' . PHP_EOL);
             return 1;
@@ -71,9 +83,12 @@ final class CliApplication
         return ['commands' => [
             'database:check [--json]',
             'system:status [--json]',
+            'backup:create --actor=USERNAME --confirm=CREATE_DATABASE_BACKUP [--json]',
+            'plugin:initialize-defaults [--json]',
             'plugin:finalize-pending [--json]',
             'scan:create --actor=USERNAME --library=ULID --type=incremental|full --confirm=QUEUE_SCAN [--json]',
             'artist-profile:refresh-all --actor=USERNAME --confirm=REFRESH_ALL_ARTIST_PROFILES [--json]',
+            'metadata-policy:reproject --actor=USERNAME --confirm=REPROJECT_METADATA_POLICY [--json]',
             'user:reset-password --username=USERNAME --password-stdin --confirm=RESET_PASSWORD [--json]',
             'dlna:devices --actor=USERNAME [--json]',
             'dlna:play --actor=USERNAME --device=UUID --song=ULID [--format=raw|mp3|aac|opus] [--json]',
@@ -121,6 +136,35 @@ final class CliApplication
                 'metadataBatches' => Db::connection()->getSchemaBuilder()->hasTable('metadata_batch_plans')
                     ? Db::table('metadata_batch_plans')->whereIn('status', ['queued', 'running'])->count() : 0,
             ]];
+    }
+
+    /**
+     * 为现有活动管理员创建在线一致的 SQLite 备份。
+     *
+     * 命令要求 `manage_system` 和不可缩写确认词，不接受路径或文件名。服务仅返回不透明备份 ID、大小和
+     * 创建时间；快照完整性校验及原子发布完成后才写审计，失败不会覆盖上一份有效备份。
+     */
+    private function createBackup(array $options): array
+    {
+        $this->allowedOptions($options, ['actor', 'confirm', 'json']);
+        if (($options['confirm'] ?? null) !== 'CREATE_DATABASE_BACKUP') {
+            throw new InvalidArgumentException('数据库备份确认词必须是 CREATE_DATABASE_BACKUP。');
+        }
+        $actor = $this->actor($this->required($options, 'actor'), 'manage_system');
+        return (new SqliteBackupService())->createManual((string) $actor['id'], $this->requestId());
+    }
+
+    /**
+     * 在核心迁移完成且任何 Webman/插件 Worker 尚未启动时初始化镜像默认插件。
+     *
+     * 命令不接受 key、ZIP 或目录参数，默认插件集合只能由已签名镜像内的版本化清单决定。每个 key 只在
+     * 当前持久数据根初始化一次；已有安装和管理员后续卸载都会被尊重。任一完整性或数据库错误返回非零，
+     * entrypoint 随即停止，不能在缺少声明默认能力的半初始化状态启动业务进程。
+     */
+    private function initializeDefaultPlugins(array $options): array
+    {
+        $this->allowedOptions($options, ['json']);
+        return (new InitialPluginPackageService())->initialize();
     }
 
     /**
@@ -192,6 +236,25 @@ final class CliApplication
             $this->requestId(),
         );
         return ['queued' => true, 'type' => 'artist_profile_refresh'] + $result;
+    }
+
+    /**
+     * 把已保存的元数据优先级与繁转简策略重新应用到历史业务投影。
+     *
+     * 命令要求系统管理与元数据编辑能力及不可缩写确认词。执行只调用分批领域服务，不读取媒体、访问插件
+     * 或绕过字段锁；部分批次后中断可使用同一命令安全重跑。输出只含对象/字段计数，不暴露媒体名称或路径。
+     */
+    private function reprojectMetadataPolicy(array $options): array
+    {
+        $this->allowedOptions($options, ['actor', 'confirm', 'json']);
+        if (($options['confirm'] ?? null) !== 'REPROJECT_METADATA_POLICY') {
+            throw new InvalidArgumentException('元数据策略重投影确认词必须是 REPROJECT_METADATA_POLICY。');
+        }
+        $actor = $this->actor($this->required($options, 'actor'), 'manage_system', 'edit_metadata');
+        return ['reprojected' => true] + (new MetadataPolicyReprojectionService())->reprojectAll(
+            (string) $actor['id'],
+            $this->requestId(),
+        );
     }
 
     /**

@@ -3,29 +3,55 @@
 declare(strict_types=1);
 
 use app\process\Http;
+use app\process\DerivedMediaWorker;
 use app\process\LibraryAutomationWorker;
 use app\process\LibraryScanWorker;
 use app\process\LastfmPlaylistSyncWorker;
+use app\process\MediaGatewayProcess;
 use app\process\MetadataBatchWorker;
 use app\process\NotificationCleanupWorker;
 use app\process\PersonalDataExportWorker;
 use app\process\PlaybackPrefetchWorker;
-use app\process\ResourcePluginWorker;
-use app\process\ResourcePluginTranscodeWorker;
-use app\process\RuntimeMaintenanceWorker;
 use app\process\PlaylistAutoCompletionWorker;
-use app\process\DerivedMediaWorker;
+use app\process\ResourcePluginEventWorker;
+use app\process\ResourcePluginTranscodeWorker;
+use app\process\ResourcePluginWorker;
+use app\process\RuntimeMaintenanceWorker;
 use app\process\ScrobbleDeliveryWorker;
 use app\process\UploadWorker;
+use app\process\AutomaticDatabaseBackupWorker;
 use support\Log;
 use support\Request;
 
 global $argv;
 
+$mediaGatewayEnabled = (bool) config('media_delivery.enabled', false);
+$mediaGatewayPublicPort = (int) config('media_delivery.public_port', 8787);
+$mediaGatewayInternalPort = (int) config('media_delivery.internal_port', 18787);
+
 return [
+    /*
+     * Go 网关拥有唯一公开端口，仅把 API 和动态协议反代到回环 Webman；公开静态文件与 SPA 页面由 Go
+     * 从独立 public 根直接发送。进程由 Workerman master 监督但不可热重载，避免 reload 窗口争用 8787。
+     */
+    'media-gateway' => [
+        'handler' => MediaGatewayProcess::class,
+        'count' => 1,
+        'reloadable' => false,
+        'enable' => $mediaGatewayEnabled,
+        'constructor' => [
+            'binaryPath' => (string) config('media_delivery.binary_path'),
+            'listenAddress' => '0.0.0.0:' . $mediaGatewayPublicPort,
+            'upstreamOrigin' => 'http://127.0.0.1:' . $mediaGatewayInternalPort,
+            'staticRoot' => (string) config('media_delivery.static_root'),
+            'allowedRoots' => (array) config('media_delivery.allowed_roots', []),
+        ],
+    ],
     'webman' => [
         'handler' => Http::class,
-        'listen' => 'http://0.0.0.0:' . (getenv('VELIN_API_PORT') ?: '8787'),
+        'listen' => $mediaGatewayEnabled
+            ? 'http://127.0.0.1:' . $mediaGatewayInternalPort
+            : 'http://0.0.0.0:' . $mediaGatewayPublicPort,
         // SQLite benefits from bounded concurrency; operators can tune after measurement.
         'count' => max(1, (int) (getenv('VELIN_WEB_WORKERS') ?: 4)),
         'user' => '',
@@ -115,8 +141,8 @@ return [
         ],
     ],
     /*
-     * Retention is isolated from request and scan workers. One bounded batch per low-frequency tick
-     * keeps notification/replay growth finite without holding SQLite while looping over a backlog.
+     * 通知与实时事件保留任务独立于请求和扫描 Worker。每次唤醒只在批次数与墙钟预算内连续推进若干
+     * 短事务，既能在升级后尽快排空积压，也不会长期占住 SQLite 写锁而阻塞用户请求。
      */
     'notification-cleanup-worker' => [
         'handler' => NotificationCleanupWorker::class,
@@ -127,8 +153,10 @@ return [
             FILTER_VALIDATE_BOOL,
         ),
         'constructor' => [
-            'interval' => max(60.0, (float) (getenv('VELIN_NOTIFICATION_CLEANUP_SECONDS') ?: 3600)),
+            'interval' => max(60.0, (float) (getenv('VELIN_NOTIFICATION_CLEANUP_SECONDS') ?: 300)),
             'batchSize' => max(1, min(1000, (int) (getenv('VELIN_NOTIFICATION_CLEANUP_BATCH') ?: 500))),
+            'maxBatchesPerTick' => max(1, min(20, (int) (getenv('VELIN_NOTIFICATION_CLEANUP_MAX_BATCHES') ?: 8))),
+            'timeBudgetSeconds' => max(0.1, min(10.0, (float) (getenv('VELIN_NOTIFICATION_CLEANUP_TIME_BUDGET_SECONDS') ?: 2))),
         ],
     ],
     /*
@@ -142,6 +170,19 @@ return [
         'enable' => filter_var(getenv('VELIN_RUNTIME_MAINTENANCE_ENABLED') ?: 'true', FILTER_VALIDATE_BOOL),
         'constructor' => [
             'interval' => max(3_600.0, (float) (getenv('VELIN_RUNTIME_MAINTENANCE_SECONDS') ?: 21_600)),
+        ],
+    ],
+    /*
+     * SQLite 在线备份使用独立单进程和固定数据根。VACUUM INTO 不在 HTTP Worker 中运行，服务内锁会
+     * 与 CLI 手工备份互斥；关闭后不会删除现有备份，重新启用时从下一次周期继续。
+     */
+    'automatic-database-backup-worker' => [
+        'handler' => AutomaticDatabaseBackupWorker::class,
+        'count' => 1,
+        'reloadable' => true,
+        'enable' => filter_var(getenv('VELIN_AUTOMATIC_BACKUP_ENABLED') ?: 'true', FILTER_VALIDATE_BOOL),
+        'constructor' => [
+            'interval' => max(3_600.0, (float) (getenv('VELIN_AUTOMATIC_BACKUP_SECONDS') ?: 86_400)),
         ],
     ],
     /* 个人数据导出分页读取和私有产物写入使用独立单消费者，停用账号会在数据库状态机中请求取消。 */
@@ -200,14 +241,27 @@ return [
         ],
     ],
     /*
+     * 用户插件事件只保存在 Redis 有限期队列中，不增加 SQLite 写并发。单消费者按插件独立游标投递；
+     * Redis 或插件故障不会阻断核心业务，事件过期后自动删除且不从业务库补造。
+     */
+    'resource-plugin-event-worker' => [
+        'handler' => ResourcePluginEventWorker::class,
+        'count' => 1,
+        'reloadable' => true,
+        'enable' => filter_var(getenv('VELIN_PLUGIN_EVENT_WORKER_ENABLED') ?: 'true', FILTER_VALIDATE_BOOL),
+        'constructor' => [
+            'pollInterval' => max(0.5, (float) (getenv('VELIN_PLUGIN_EVENT_POLL_SECONDS') ?: 2)),
+        ],
+    ],
+    /*
      * 下载完成后的媒体发布/转码独立于来源轮询。进程数是安全上限，实际 FFmpeg 并发仍由后台
      * system.limits.maxConcurrentTranscodes 和插件的 TranscodeAdmission 动态收口；调低后台限制不会
-     * 中断已有转码，调高后新任务可立即占用空闲槽位。进程数默认覆盖允许的 1-16 槽位，避免后台把并发
-     * 调高后仍被固定进程数截断；空闲进程只做有界轮询，不会启动 FFmpeg。
+     * 中断已有转码。默认两个进程与系统默认并发一致，避免十六个空闲进程持续轮询；需要扩容时必须同时
+     * 调高后台限制和显式环境变量，进程数仍限制在 1-16，空闲进程不会启动 FFmpeg。
      */
     'resource-plugin-transcode-worker' => [
         'handler' => ResourcePluginTranscodeWorker::class,
-        'count' => max(1, min(16, (int) (getenv('VELIN_RESOURCE_PLUGIN_TRANSCODE_WORKERS') ?: 16))),
+        'count' => max(1, min(16, (int) (getenv('VELIN_RESOURCE_PLUGIN_TRANSCODE_WORKERS') ?: 2))),
         'reloadable' => true,
         'enable' => filter_var(getenv('VELIN_RESOURCE_PLUGIN_TRANSCODE_WORKER_ENABLED') ?: 'true', FILTER_VALIDATE_BOOL),
         'constructor' => [

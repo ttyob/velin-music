@@ -5,35 +5,46 @@ declare(strict_types=1);
 namespace app\application\Admin;
 
 use app\application\Auth\AuthorizationDenied;
+use app\application\System\SqliteBackupStatusService;
 use app\application\System\SystemLimitSettingsService;
 use stdClass;
 use support\Db;
 use Throwable;
 
 /**
- * Builds a capability- and library-scoped administration status snapshot (ADMIN-DASH-001).
+ * 构建按 capability 与音乐库管理范围裁剪的后台状态快照（ADMIN-DASH-001）。
  *
- * Every optional module is omitted unless the authoritative Session projection contains its
- * capability. Library and scan queries additionally intersect the actor's current manage-level
- * library IDs. The response uses logical root labels and anonymous counts only: physical paths,
- * email, playback titles, secrets and raw errors never cross this boundary.
+ * 可选模块仅在权威 Session 投影包含对应能力时出现，音乐库与扫描查询还会和操作者当前 manage 级库 ID
+ * 求交集。系统管理员的备份模块只读取固定目录汇总；响应始终只使用逻辑名称、匿名计数和稳定原因码，
+ * 物理路径、邮箱、播放曲目、秘密、文件名、摘要与原始错误均不得跨越此边界。本服务只读且不承担任务
+ * 创建、文件维护、备份或恢复职责。
  */
 final class AdminOverviewService
 {
-    /** Global capabilities that make the administration shell meaningful. */
+    /** 至少具备其中一项全局能力才可进入后台外壳；对象权限仍由各模块再次收窄。 */
     public const ADMIN_CAPABILITIES = [
         'manage_users', 'manage_library', 'manage_storage', 'manage_system',
         'view_audit', 'run_scrape', 'edit_metadata', 'view_play_privacy',
     ];
 
     /**
-     * Returns independently sampled modules so one unavailable probe does not erase the dashboard.
+     * 注入只读备份探针以隔离文件系统测试；生产默认在真正需要该模块时才按数据库配置创建探针。
      *
-     * The method is read-only. Filesystem probes use metadata/capacity calls only and never create,
-     * open for writing, scan media contents, or enqueue work. Each module carries its own UTC sample
-     * time because filesystem and database checks may complete at different moments.
+     * 延迟创建保证不具备 manage_system 的操作者不会访问数据库备份目录。依赖只读，不持有请求数据，
+     * 也不提供创建或恢复能力。
+     */
+    public function __construct(private readonly ?SqliteBackupStatusService $backupStatus = null)
+    {
+    }
+
+    /**
+     * 返回独立采样的权限模块，使单个探针失败不会抹去整张概览。
      *
-     * @param array<string, mixed> $actor Revalidated current-user projection from SessionService.
+     * 本方法只读。文件系统探针只读取元信息，不创建目录、不写文件、不读取媒体正文，也不排队任务。
+     * 每个模块携带各自 UTC 采样时间，因为数据库和文件系统检查并非同一瞬间完成。探针异常被隔离为
+     * unknown 和统一原因码；权限不足的模块直接省略，不能用 unknown 暗示该模块存在。
+     *
+     * @param array<string, mixed> $actor SessionService 已实时复验的当前用户投影
      * @return array{modules: array<string, array<string, mixed>>}
      */
     public function snapshot(array $actor): array
@@ -52,6 +63,8 @@ final class AdminOverviewService
             $modules['accounts'] = $this->module(fn (): array => $this->accounts());
         }
         if (in_array('manage_system', $capabilities, true)) {
+            $modules['backups'] = $this->module(fn (): array =>
+                ($this->backupStatus ?? new SqliteBackupStatusService())->status());
             // The lock-only admission mechanism has no reliable observer for active leases. Returning
             // unknown is deliberate until persistent metrics exist; zero would conceal saturation.
             $modules['transcoding'] = [

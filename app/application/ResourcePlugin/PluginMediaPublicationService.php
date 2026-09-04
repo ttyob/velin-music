@@ -8,6 +8,7 @@ use app\application\Library\RemoteLibraryClientFactory;
 use app\application\Library\RemoteLibraryUnavailable;
 use app\application\Library\RemotePublicationConflict;
 use Illuminate\Database\QueryException;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
 use stdClass;
 use support\Db;
 use Symfony\Component\Uid\Ulid;
@@ -32,6 +33,7 @@ final readonly class PluginMediaPublicationService
     public function __construct(
         private RemoteLibraryClientFactory $remoteClients = new RemoteLibraryClientFactory(),
         private ?PhpResourcePluginWorkspaceService $workspaces = null,
+        private PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
     ) {
     }
 
@@ -104,13 +106,25 @@ final readonly class PluginMediaPublicationService
                     ? $this->publishLocal((string) $library->resolved_root_path, $source, $relativePath, $size, $sha256)
                     : $remote->version;
                 $finished = gmdate('Y-m-d\TH:i:s\Z');
-                Db::table('plugin_media_publications')->where('id', (string) $row->id)
+                $committed = Db::table('plugin_media_publications')->where('id', (string) $row->id)
                     ->where('status', 'uploading')->update([
                         'status' => 'published', 'remote_version' => $version,
                         'discovery_etag' => $remote?->discoveryEtag,
                         'error_code' => null, 'published_at' => $finished, 'updated_at' => $finished,
                     ]);
+                if ($committed !== 1) {
+                    throw new PluginMediaPublicationFailed('PLUGIN_MEDIA_PUBLICATION_LEASE_LOST');
+                }
                 $row->status = 'published';
+                // 文件与发布账本已经提交；Redis 只承载有限期扩展通知，故障不能触发远端删除或本地补偿。
+                $this->pluginEvents->publish(
+                    PluginDomainEvent::MEDIA_PUBLISHED,
+                    'plugin_media_publication',
+                    (string) $row->id,
+                    'plugin',
+                    $pluginKey,
+                    ['libraryId' => $libraryId, 'taskId' => $taskId, 'format' => $format, 'sizeBytes' => $size],
+                );
                 return $this->result($row);
             } catch (RemotePublicationConflict $failure) {
                 if ($candidate === 0 && $relativePath === $basePath && $collisionPath !== $basePath

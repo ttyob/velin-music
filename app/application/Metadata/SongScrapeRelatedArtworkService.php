@@ -31,6 +31,7 @@ final readonly class SongScrapeRelatedArtworkService
         private ArtworkCurrentStateService $currentArtwork = new ArtworkCurrentStateService(),
         private CapabilityResolver $capabilities = new CapabilityResolver(),
         private LibraryAccessResolver $libraries = new LibraryAccessResolver(),
+        private MetadataScrapePolicyService $scrapePolicy = new MetadataScrapePolicyService(),
     ) {}
 
     /**
@@ -53,7 +54,7 @@ final readonly class SongScrapeRelatedArtworkService
                 // 复验并拒绝覆盖已有扫描图、手工选择图或历史有效 Provider 图。
                 if ($automatic && $this->currentArtwork->exists(
                     $entity['type'], $entity['id'], (string) $target->library_id,
-                )) continue;
+                ) && !$this->providerMayReplace($entity['type'])) continue;
                 if ($automatic && $this->reusableEmptySearch($target, $entity, $actor) instanceof stdClass) {
                     continue;
                 }
@@ -275,6 +276,12 @@ final readonly class SongScrapeRelatedArtworkService
         );
         return Db::table('artwork_provider_search_jobs')->where('scrape_target_id', (string) $target->id)
             ->where($entity['type'] . '_id', $entity['id'])->count() > $before;
+    }
+
+    /** 专辑图仅在管理员明确选择三方优先时允许越过扫描图；艺人图仍保持只补空缺。 */
+    private function providerMayReplace(string $type): bool
+    {
+        return $type === 'album' && $this->scrapePolicy->providerOverridesMetadata('albumArtwork');
     }
 
     /**

@@ -29,7 +29,8 @@ use app\controller\Api\V1\AirplayController;
 use app\controller\Api\V1\ExternalPlaybackTicketController;
 use app\controller\Api\V1\DownloadController;
 use app\controller\Api\V1\PlaylistController;
-use app\controller\Api\V1\Admin\RecommendationController;
+use app\controller\Api\V1\RecommendationController;
+use app\controller\Api\V1\Admin\RecommendationController as AdminRecommendationController;
 use app\controller\Api\V1\Admin\AdminPlaylistController;
 use app\controller\Api\V1\SmartPlaylistController;
 use app\controller\Api\V1\RadioController;
@@ -142,10 +143,15 @@ Route::get('/api/v1/songs', [MediaController::class, 'songs']);
 // 固定发现路径必须先于 `{songId}` 注册，避免把资源名误解释为歌曲 ID。
 Route::get('/api/v1/songs/frequently-played', [MediaController::class, 'frequentlyPlayedSongs']);
 Route::get('/api/v1/songs/random-recommendations', [MediaController::class, 'randomRecommendationSongs']);
+Route::get('/api/v1/recommendations/daily', [RecommendationController::class, 'daily']);
+Route::get('/api/v1/recommendations/playlists', [RecommendationController::class, 'playlists']);
+Route::post('/api/v1/recommendations/missing-song-detail', [RecommendationController::class, 'missingSongDetail']);
+Route::get('/api/v1/songs/{songId}/similar', [RecommendationController::class, 'similarSongs']);
 Route::get('/api/v1/songs/{songId}', [MediaController::class, 'song']);
 Route::get('/api/v1/albums', [MediaController::class, 'albums']);
 Route::get('/api/v1/albums/{albumId}', [MediaController::class, 'album']);
 Route::get('/api/v1/artists', [MediaController::class, 'artists']);
+Route::get('/api/v1/artists/{artistId}/similar', [RecommendationController::class, 'similarArtists']);
 Route::get('/api/v1/artists/{artistId}', [MediaController::class, 'artist']);
 Route::get('/api/v1/genres', [MediaController::class, 'genres']);
 Route::get('/api/v1/years', [MediaController::class, 'years']);
@@ -309,6 +315,12 @@ Route::delete('/api/v1/admin/jobs/{jobId}', [JobController::class, 'clear'])
     ->middleware(VerifyCsrfToken::class);
 // 插件由管理员上传完整受信 PHP 包；核心只负责生命周期、目录投影和自有页面资源鉴权。
 Route::get('/api/v1/admin/resource-plugins', [ResourcePluginController::class, 'index']);
+Route::get('/api/v1/admin/resource-plugin-store/config', [ResourcePluginController::class, 'storeConfiguration']);
+Route::put('/api/v1/admin/resource-plugin-store/config', [ResourcePluginController::class, 'updateStoreConfiguration'])
+    ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/resource-plugin-store/catalog', [ResourcePluginController::class, 'storeCatalog']);
+Route::post('/api/v1/admin/resource-plugin-store/plugins/{pluginKey}', [ResourcePluginController::class, 'installStorePlugin'])
+    ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/resource-plugins/{pluginKey}/backups', [ResourcePluginController::class, 'backups']);
 Route::post('/api/v1/admin/resource-plugins/{pluginKey}/backups/purge', [ResourcePluginController::class, 'purgeBackups'])
     ->middleware(VerifyCsrfToken::class);
@@ -317,6 +329,9 @@ Route::post('/api/v1/admin/php-resource-plugins', [ResourcePluginController::cla
 Route::patch('/api/v1/admin/php-resource-plugins/{pluginKey}/state', [ResourcePluginController::class, 'updatePhpState'])
     ->middleware(VerifyCsrfToken::class);
 Route::delete('/api/v1/admin/php-resource-plugins/{pluginKey}', [ResourcePluginController::class, 'uninstallPhp'])
+    ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/resource-plugins/{pluginKey}/admin-actions', [ResourcePluginController::class, 'adminActions']);
+Route::post('/api/v1/admin/resource-plugins/{pluginKey}/admin-actions/{actionKey}', [ResourcePluginController::class, 'runAdminAction'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/resource-plugins/{pluginKey}/page/{assetPath:.+}', [ResourcePluginController::class, 'pageAsset']);
 // 插件业务通过核心固定路由动态分发，首次安装无需重启 Webman 来注册插件私有路由。
@@ -362,8 +377,11 @@ Route::get('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/tasks', [
 Route::delete('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/tasks', [ResourcePluginController::class, 'clearMetadataTasks'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/tasks/{taskId}', [ResourcePluginController::class, 'metadataTask']);
+Route::get('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/tasks/{taskId}/log', [ResourcePluginController::class, 'metadataTaskLog']);
 Route::post('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/tasks/{taskId}/retry', [ResourcePluginController::class, 'retryMetadataTask'])
     ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/resource-plugins/{pluginKey}/library-files', [ResourcePluginController::class, 'libraryFiles']);
+Route::get('/api/v1/admin/resource-plugins/{pluginKey}/library-files/{songId}', [ResourcePluginController::class, 'libraryFile']);
 Route::get('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/artist-database', [ResourcePluginController::class, 'artistDatabaseStatus']);
 Route::post('/api/v1/admin/resource-plugins/{pluginKey}/metadata-scrape/artist-database/uploads', [ResourcePluginController::class, 'artistDatabaseUpload'])
     ->middleware(VerifyCsrfToken::class);
@@ -453,6 +471,8 @@ Route::post('/api/v1/admin/media/scrape-history/clear-records', [MetadataSyncScr
 Route::get('/api/v1/admin/media/sync-scrape-jobs/{jobId}', [MetadataSyncScrapeController::class, 'show']);
 Route::post('/api/v1/admin/media/sync-scrape-jobs/{jobId}/confirm', [MetadataSyncScrapeController::class, 'confirm'])
     ->middleware(VerifyCsrfToken::class);
+Route::post('/api/v1/admin/media/sync-scrape-targets/{targetId}/apply-stored-candidate', [MetadataSyncScrapeController::class, 'applyStoredCandidate'])
+    ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/artworks/{type}/{entityId}', [ArtworkAdminController::class, 'show']);
 Route::post('/api/v1/admin/artworks/{type}/{entityId}/candidates', [ArtworkAdminController::class, 'upload'])
     ->middleware(VerifyCsrfToken::class);
@@ -489,6 +509,8 @@ Route::put('/api/v1/admin/media/{type}/{mediaId}/overrides', [MediaMetadataContr
 Route::delete('/api/v1/admin/media/{type}/{mediaId}/overrides', [MediaMetadataController::class, 'clear'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/metadata/entities/{type}/{entityId}/songs', [MetadataEntityController::class, 'songs']);
+Route::delete('/api/v1/admin/metadata/entities/{type}/{entityId}', [MetadataEntityController::class, 'deleteEntity'])
+    ->middleware(VerifyCsrfToken::class);
 Route::post('/api/v1/admin/metadata/merge-preview', [MetadataEntityController::class, 'mergePreview'])
     ->middleware(VerifyCsrfToken::class);
 Route::post('/api/v1/admin/metadata/merge', [MetadataEntityController::class, 'merge'])
@@ -554,6 +576,9 @@ Route::put('/api/v1/admin/system-settings/limits', [SystemSettingsController::cl
 Route::get('/api/v1/admin/system-settings/proxy', [SystemSettingsController::class, 'showProxy']);
 Route::put('/api/v1/admin/system-settings/proxy', [SystemSettingsController::class, 'updateProxy'])
     ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/system-settings/metadata-scrape-policy', [SystemSettingsController::class, 'showMetadataScrapePolicy']);
+Route::put('/api/v1/admin/system-settings/metadata-scrape-policy', [SystemSettingsController::class, 'updateMetadataScrapePolicy'])
+    ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/system-maintenance', [SystemSettingsController::class, 'showMaintenance']);
 Route::post('/api/v1/admin/system-maintenance/cleanup', [SystemSettingsController::class, 'cleanupMaintenance'])
     ->middleware(VerifyCsrfToken::class);
@@ -586,10 +611,10 @@ Route::patch('/api/v1/admin/playlists/{playlistId}/auto-completion', [AdminPlayl
 Route::post('/api/v1/admin/playlists/{playlistId}/auto-completion/reset', [AdminPlaylistController::class, 'resetAutoCompletion'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/playlists/{playlistId}/auto-completion/logs', [AdminPlaylistController::class, 'autoCompletionLog']);
-Route::get('/api/v1/admin/recommendations/lastfm', [RecommendationController::class, 'show']);
-Route::put('/api/v1/admin/recommendations/lastfm', [RecommendationController::class, 'update'])
+Route::get('/api/v1/admin/recommendations/lastfm', [AdminRecommendationController::class, 'show']);
+Route::put('/api/v1/admin/recommendations/lastfm', [AdminRecommendationController::class, 'update'])
     ->middleware(VerifyCsrfToken::class);
-Route::post('/api/v1/admin/recommendations/lastfm/refresh', [RecommendationController::class, 'refresh'])
+Route::post('/api/v1/admin/recommendations/lastfm/refresh', [AdminRecommendationController::class, 'refresh'])
     ->middleware(VerifyCsrfToken::class);
 
 /*

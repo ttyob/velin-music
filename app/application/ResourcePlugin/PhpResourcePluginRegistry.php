@@ -19,10 +19,17 @@ use app\application\ResourcePlugin\Contract\ExternalArtistArtworkHook;
 use app\application\ResourcePlugin\Contract\ExternalArtistProfileHook;
 use app\application\ResourcePlugin\Contract\ExternalMetadataScrapePluginRegistry;
 use app\application\ResourcePlugin\Contract\MetadataScrapeAdminHook;
+use app\application\ResourcePlugin\Contract\MetadataScrapeLogExportHook;
 use app\application\ResourcePlugin\Contract\AdminSubscriptionHook;
 use app\application\ResourcePlugin\Contract\AdminSubscriptionDiagnosticsHook;
 use app\application\ResourcePlugin\Contract\PhpResourcePlugin;
 use app\application\ResourcePlugin\Contract\PluginDatabaseLifecycle;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\Contract\PluginEventSubscriberHook;
+use app\application\ResourcePlugin\Contract\PluginRecommendationProviderHook;
+use app\application\ResourcePlugin\Contract\RecommendationPluginRegistry;
+use app\application\ResourcePlugin\Contract\PluginAdminActionHook;
+use app\application\ResourcePlugin\Contract\PluginAdminPageHook;
 use app\application\ResourcePlugin\Contract\PluginWorkerHook;
 use app\application\ResourcePlugin\Contract\PluginTranscodeWorkerHook;
 use app\application\ResourcePlugin\Contract\BulkDownloadCleanupHook;
@@ -37,15 +44,17 @@ use Throwable;
  * 钩子接口一一对应，避免仅靠字符串声明获得搜索、下载或 Worker 权限。这里不缓存实例，使测试和长驻
  * Worker 重载后都重新读取已安装包；未知或损坏插件只形成 invalid 投影，不阻断 Velin 其他功能。
  */
-final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginRegistry, ExternalMetadataScrapePluginRegistry, ExternalPlaylistPluginRegistry
+final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginRegistry, ExternalMetadataScrapePluginRegistry, ExternalPlaylistPluginRegistry, RecommendationPluginRegistry
 {
     private const REQUIRED_FIELDS = ['capabilities', 'class', 'key', 'name', 'protocolVersion', 'version'];
     private const OPTIONAL_FIELDS = ['adminPage', 'metadata'];
     private const CAPABILITIES = [
+        'admin_page', 'admin_action',
         'admin_page_search', 'admin_page_download', 'admin_page_subscription', 'external_music_completion',
         'metadata_scrape', 'metadata_album', 'metadata_artist_artwork', 'metadata_artist_profile', 'metadata_artist_database', 'worker', 'database_lifecycle',
         'transcode_worker',
-        'playlist_identification', 'playlist_sync',
+        'playlist_identification', 'playlist_sync', 'recommendation_provider', 'event_subscriber',
+        'library_file_inspection',
     ];
 
     public function __construct(private ?string $root = null)
@@ -281,6 +290,24 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
         return $plugin;
     }
 
+    /**
+     * 返回只读推荐与缺失歌曲详情 Hook。
+     *
+     * 推荐能力不能从歌单同步或元数据刮削接口推断；插件必须显式声明 capability、实现固定接口并通过
+     * 当前数据库账本校验。停用、待升级、待卸载或结构不匹配时失败关闭，调用方只能使用自身已经授权的
+     * 本地推荐降级，不能相信插件返回的本地媒体 ID。
+     */
+    public function recommendation(string $key): PluginRecommendationProviderHook
+    {
+        $plugin = $this->get($key);
+        if (!$plugin instanceof PluginRecommendationProviderHook
+            || !in_array('recommendation_provider', $plugin->descriptor()['capabilities'], true)) {
+            throw new PhpResourcePluginInvalid('PHP_PLUGIN_RECOMMENDATION_UNAVAILABLE');
+        }
+        $this->assertDatabaseCurrent($plugin, $key);
+        return $plugin;
+    }
+
     /** 返回最终专辑刮削钩子；插件内部必须完成来源聚合，核心只接收一条专辑结论。 */
     public function metadataAlbum(string $key): ExternalAlbumScrapeHook
     {
@@ -329,6 +356,23 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
         if (!$plugin instanceof MetadataScrapeAdminHook
             || !in_array('metadata_scrape', $plugin->descriptor()['capabilities'], true)) {
             throw new PhpResourcePluginInvalid('PHP_PLUGIN_METADATA_SCRAPE_ADMIN_UNAVAILABLE');
+        }
+        $this->assertDatabaseCurrent($plugin, $key);
+        return $plugin;
+    }
+
+    /**
+     * 复验文件检查页面所属插件。
+     *
+     * 文件列表和详情始终由核心服务生成，返回插件实例仅用于同时验证安装状态、启用状态、数据库账本、
+     * manifest 能力和管理接口；调用方不得据此把任意核心查询或路径访问委托给插件代码。
+     */
+    public function libraryFileInspection(string $key): MetadataScrapeAdminHook
+    {
+        $plugin = $this->get($key);
+        if (!$plugin instanceof MetadataScrapeAdminHook
+            || !in_array('library_file_inspection', $plugin->descriptor()['capabilities'], true)) {
+            throw new PhpResourcePluginInvalid('PHP_PLUGIN_LIBRARY_FILE_INSPECTION_UNAVAILABLE');
         }
         $this->assertDatabaseCurrent($plugin, $key);
         return $plugin;
@@ -421,6 +465,62 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
         }
         $this->assertDatabaseCurrent($plugin, $key);
         return $plugin;
+    }
+
+    /** 返回固定管理员动作钩子；页面、下载或普通 Worker 能力不能被推断为可执行管理命令。 */
+    public function adminActions(string $key): PluginAdminActionHook
+    {
+        $plugin = $this->get($key);
+        if (!$plugin instanceof PluginAdminActionHook
+            || !in_array('admin_action', $plugin->descriptor()['capabilities'], true)) {
+            throw new PhpResourcePluginInvalid('PHP_PLUGIN_ADMIN_ACTION_UNAVAILABLE');
+        }
+        $this->assertDatabaseCurrent($plugin, $key);
+        return $plugin;
+    }
+
+    /**
+     * 返回经过安装状态、manifest、接口、数据库版本和订阅白名单复验的事件订阅钩子。
+     *
+     * subscribedEvents 会执行插件代码，因此只在独立事件 Worker 中调用；空列表、重复项或未知版本事件
+     * 失败关闭，不能被解释为订阅所有事件。该方法不读取 Redis，也不缓存实例，插件禁用后下一轮立即停止。
+     */
+    public function eventSubscriber(string $key): PluginEventSubscriberHook
+    {
+        $plugin = $this->get($key);
+        if (!$plugin instanceof PluginEventSubscriberHook
+            || !in_array('event_subscriber', $plugin->descriptor()['capabilities'], true)) {
+            throw new PhpResourcePluginInvalid('PHP_PLUGIN_EVENT_SUBSCRIBER_UNAVAILABLE');
+        }
+        $this->assertDatabaseCurrent($plugin, $key);
+        $subscriptions = $plugin->subscribedEvents();
+        if (!is_array($subscriptions) || !array_is_list($subscriptions) || $subscriptions === []
+            || count(array_unique($subscriptions)) !== count($subscriptions)
+            || array_diff($subscriptions, PluginDomainEvent::names()) !== []) {
+            throw new PhpResourcePluginInvalid('PHP_PLUGIN_EVENT_SUBSCRIPTIONS_INVALID');
+        }
+        return $plugin;
+    }
+
+    /**
+     * 返回当前可以消费 Redis 事件的活动插件 key。
+     *
+     * 与普通插件 Worker 相同，每轮从目录和 SQLite 生命周期账本重新发现；这里只形成 key 列表，不调用
+     * subscribedEvents 或 Redis。损坏、禁用、待重启、待卸载或数据库版本不一致的包均不会领取新事件。
+     *
+     * @return list<string>
+     */
+    public function eventSubscriberKeys(): array
+    {
+        $keys = [];
+        foreach ($this->list() as $item) {
+            if (($item['valid'] ?? false) === true
+                && ($item['enabled'] ?? true) === true
+                && in_array('event_subscriber', $item['capabilities'] ?? [], true)) {
+                $keys[] = (string) $item['key'];
+            }
+        }
+        return $keys;
     }
 
     /**
@@ -596,7 +696,7 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
         $manifest['adminPage'] ??= null;
         $manifest['metadata'] ??= null;
         if ($manifest['adminPage'] === null
-            && array_intersect($manifest['capabilities'], ['admin_page_search', 'admin_page_download']) !== []) {
+            && array_intersect($manifest['capabilities'], ['admin_page', 'admin_page_search', 'admin_page_download']) !== []) {
             throw new PhpResourcePluginInvalid();
         }
         // 插件 key 可包含 URL 友好的连字符；PHP namespace 段必须把连字符确定性映射为下划线。
@@ -645,6 +745,8 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
             || !$this->text($descriptor['description'] ?? null, 1, 500)) throw new PhpResourcePluginInvalid();
         foreach ($manifest['capabilities'] as $capability) {
             $valid = match ($capability) {
+                'admin_page' => $plugin instanceof PluginAdminPageHook && $manifest['adminPage'] !== null,
+                'admin_action' => $plugin instanceof PluginAdminActionHook,
                 'admin_page_search' => $plugin instanceof ExternalMusicSearchHook,
                 'admin_page_download' => $plugin instanceof ExternalDownloadHook,
                 'admin_page_subscription' => $plugin instanceof AdminSubscriptionHook,
@@ -656,9 +758,13 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
                 'metadata_artist_database' => $plugin instanceof MetadataScrapeAdminHook,
                 'playlist_identification' => $plugin instanceof ExternalPlaylistIdentificationHook,
                 'playlist_sync' => $plugin instanceof ExternalPlaylistSyncHook,
+                'recommendation_provider' => $plugin instanceof PluginRecommendationProviderHook,
+                // 文件管理器能力由元数据插件管理合同提供；必须同时校验 manifest 和真实接口，避免仅凭声明开放文件边界。
+                'library_file_inspection' => $plugin instanceof MetadataScrapeAdminHook,
                 'worker' => $plugin instanceof PluginWorkerHook,
                 'transcode_worker' => $plugin instanceof PluginTranscodeWorkerHook,
                 'database_lifecycle' => $plugin instanceof PluginDatabaseLifecycle,
+                'event_subscriber' => $plugin instanceof PluginEventSubscriberHook,
             };
             if (!$valid) throw new PhpResourcePluginInvalid();
         }
@@ -691,10 +797,16 @@ final readonly class PhpResourcePluginRegistry implements ExternalMusicPluginReg
             ExternalArtistArtworkHook::class,
             ExternalArtistProfileHook::class,
             MetadataScrapeAdminHook::class,
+            MetadataScrapeLogExportHook::class,
             ExternalMusicPluginRegistry::class,
             ExternalMusicSearchHook::class,
             PhpResourcePlugin::class,
+            PluginAdminActionHook::class,
+            PluginAdminPageHook::class,
             PluginDatabaseLifecycle::class,
+            PluginDomainEvent::class,
+            PluginEventSubscriberHook::class,
+            PluginRecommendationProviderHook::class,
             PluginWorkerHook::class,
             PluginTranscodeWorkerHook::class,
             RetryableExternalDownloadHook::class,

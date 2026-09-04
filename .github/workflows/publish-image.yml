@@ -1,26 +1,77 @@
-name: Publish Velin Music backend image
+name: Publish Velin Music image and release
 
 on:
   push:
     tags:
       - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: '重新执行的既有稳定版本，例如 0.0.1'
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
+concurrency:
+  group: velin-public-release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/velin-music-backend
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/velin-music
 
 jobs:
   image:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout public backend source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve immutable release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag="v$INPUT_VERSION"
+            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+            git checkout --detach "$tag"
+          fi
+          version=${tag#v}
+          printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo '发布版本必须是稳定 SemVer 标签 vMAJOR.MINOR.PATCH' >&2
+            exit 1
+          }
+          test "$(git tag --points-at HEAD | grep -Fx "$tag" | wc -l)" -eq 1
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify exported source manifest
+        run: sha256sum -c CONTENTS.sha256
+
+      - name: Refuse an existing immutable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release 已存在，拒绝重建或覆盖: $RELEASE_TAG" >&2
+            exit 1
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -32,17 +83,33 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push multi-architecture image
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Velin Music
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # 插件随包 Helper 当前只有经过 Alpine 验证的 amd64 静态产物；在所有插件具备同版本 arm64 Helper
+      # 和运行契约前，公开 manifest 必须诚实地只声明 linux/amd64。
+      - name: Build and push linux amd64 image
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.IMAGE_NAME }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VELIN_VERSION=${{ steps.version.outputs.version }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha
@@ -55,3 +122,156 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+      - name: Build immutable deployment and plugin assets
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          asset_root="$RUNNER_TEMP/velin-release-assets"
+          package_root="$RUNNER_TEMP/velin-music-deploy-$RELEASE_VERSION"
+          mkdir -p "$asset_root"
+          scripts/build-deployment-package.sh \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            "$RELEASE_VERSION" \
+            "$package_root"
+          tar -C "$RUNNER_TEMP" -czf "$asset_root/velin-music-deploy-$RELEASE_VERSION.tar.gz" \
+            "velin-music-deploy-$RELEASE_VERSION"
+          cp -- release-assets/plugins/*.zip "$asset_root/"
+          (cd "$asset_root" && sha256sum ./*.tar.gz ./*.zip > SHA256SUMS)
+          printf 'asset_root=%s\n' "$asset_root" >> "$GITHUB_ENV"
+
+      - name: Create immutable GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release 已存在，拒绝覆盖不可变附件: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "$asset_root"/velin-music-deploy-"$RELEASE_VERSION".tar.gz \
+            "$asset_root"/*.zip \
+            "$asset_root"/SHA256SUMS \
+            --verify-tag \
+            --title "Velin Music $RELEASE_VERSION" \
+            --notes "Velin Music $RELEASE_VERSION：linux/amd64 镜像、digest 固定部署包及版本化插件包。"
+
+  # 服务器部署是可选的外部副作用；只有仓库变量显式设置 DEPLOY_ENABLED=true 才会执行。部署先拉取新
+  # digest，再停 backend 制作 SQLite 冷备份；停止后的任一步骤失败都恢复旧环境。新 backend 已经启动
+  # 过时还必须恢复升级前数据库状态和旧镜像；原本没有数据库时删除失败版本新建的数据库。
+  deploy:
+    needs: image
+    if: ${{ github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: velin-production-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Deploy immutable image digest over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DEPLOY_IMAGE: ghcr.io/${{ github.repository_owner }}/velin-music@${{ needs.image.outputs.image_digest }}
+          DEPLOY_RELEASE: ${{ needs.image.outputs.version }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_USERNAME: ${{ secrets.DEPLOY_GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.DEPLOY_GHCR_TOKEN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          envs: DEPLOY_IMAGE,DEPLOY_RELEASE,DEPLOY_PATH,GHCR_USERNAME,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -eu
+            test -n "$DEPLOY_PATH"
+            test -n "$DEPLOY_RELEASE"
+            cd "$DEPLOY_PATH"
+            test -f .env
+            test "$(grep -c '^VELIN_BACKEND_IMAGE=' .env)" -eq 1
+            lock_dir=.velin-release.lock
+            mkdir "$lock_dir" || { echo '已有发布任务正在执行' >&2; exit 1; }
+            env_backup=$(mktemp ./.env.rollback.XXXXXX)
+            env_next=$(mktemp ./.env.release.XXXXXX)
+            rollback_required=false
+            database_may_have_changed=false
+            database_present=false
+            backup_dir=
+            cleanup_release_files() {
+              rm -f -- "$env_backup" "$env_next"
+              rmdir -- "$lock_dir" 2>/dev/null || true
+            }
+            finish_release() {
+              release_status=$?
+              trap - EXIT HUP INT TERM
+              if [ "$rollback_required" = true ]; then
+                set +e
+                echo '发布未完成，开始恢复旧环境、数据库状态和镜像' >&2
+                docker compose stop backend
+                cp -p -- "$env_backup" .env
+                if [ "$database_may_have_changed" = true ]; then
+                  rm -f -- docker-data/database/velin.sqlite \
+                    docker-data/database/velin.sqlite-wal docker-data/database/velin.sqlite-shm
+                  if [ "$database_present" = true ]; then
+                    cp -p -- "$backup_dir/velin.sqlite" docker-data/database/velin.sqlite
+                    for suffix in -wal -shm; do
+                      [ ! -f "$backup_dir/velin.sqlite$suffix" ] \
+                        || cp -p -- "$backup_dir/velin.sqlite$suffix" "docker-data/database/velin.sqlite$suffix"
+                    done
+                  fi
+                fi
+                docker compose pull backend
+                docker compose up -d --wait
+                rollback_status=$?
+                if [ "$rollback_status" -eq 0 ]; then
+                  echo '发布失败，已恢复旧版本' >&2
+                else
+                  echo '发布失败且旧版本恢复未通过健康检查，请使用冷备份人工恢复' >&2
+                fi
+              fi
+              cleanup_release_files
+              exit "$release_status"
+            }
+            trap finish_release EXIT
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            cp -p -- .env "$env_backup"
+            if [ -n "$GHCR_TOKEN" ]; then
+              test -n "$GHCR_USERNAME"
+              printf '%s\n' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+            fi
+            VELIN_BACKEND_IMAGE="$DEPLOY_IMAGE" docker compose pull backend
+            awk -v image="$DEPLOY_IMAGE" '
+              BEGIN { replaced = 0 }
+              /^VELIN_BACKEND_IMAGE=/ { print "VELIN_BACKEND_IMAGE=" image; replaced++; next }
+              { print }
+              END { if (replaced != 1) exit 1 }
+            ' .env > "$env_next"
+            chmod 0600 "$env_next"
+            backup_root=docker-data/database/deploy-backups
+            backup_dir="$backup_root/$DEPLOY_RELEASE-$(date -u +%Y%m%dT%H%M%SZ)"
+            mkdir -p "$backup_root"
+            test ! -e "$backup_dir"
+            rollback_required=true
+            docker compose stop backend
+            mkdir "$backup_dir"
+            if [ -f docker-data/database/velin.sqlite ]; then
+              database_present=true
+              cp -p -- docker-data/database/velin.sqlite "$backup_dir/velin.sqlite"
+              for suffix in -wal -shm; do
+                source_file="docker-data/database/velin.sqlite$suffix"
+                [ ! -f "$source_file" ] || cp -p -- "$source_file" "$backup_dir/velin.sqlite$suffix"
+              done
+            fi
+            mv -- "$env_next" .env
+            database_may_have_changed=true
+            docker compose up -d --wait
+            rollback_required=false
+            echo "Velin Music $DEPLOY_RELEASE 部署完成，冷备份位于 $backup_dir"

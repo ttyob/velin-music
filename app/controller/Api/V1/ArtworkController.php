@@ -12,6 +12,7 @@ use app\application\Auth\AuthenticationRequired;
 use app\application\Auth\AuthorizationDenied;
 use app\application\Auth\AuthorizationService;
 use app\http\JsonResponseFactory;
+use app\http\LocalFileResponseFactory;
 use app\http\RequestContext;
 use support\Log;
 use support\Request;
@@ -21,9 +22,8 @@ use Throwable;
 /**
  * 提供已授权的歌曲、专辑和艺术家原始图片，并使用私有浏览器缓存校验器。
  *
- * Image responses intentionally bypass the JSON envelope. Workerman streams the approved file;
- * this controller never buffers image bytes and never exposes a source filename or physical path.
- * Resizing/format negotiation will extend this endpoint after a bounded image library is added.
+ * 图片响应不使用 JSON envelope。Controller 完成实时权限和图片身份解析后，内置 Go 网关直接发送本地
+ * 文件；源码/裸机关闭网关时回退 Workerman。两条路径都不缓冲图片、不在公开响应暴露文件名或物理路径。
  */
 final class ArtworkController
 {
@@ -36,7 +36,13 @@ final class ArtworkController
             $artwork = (new ArtworkService())->resolveSong($actor, $songId);
             $headers = $this->headers($artwork, $requestId);
             if ($this->isNotModified($request, $artwork)) return response('', 304, $headers);
-            return response('', 200, $headers)->withFile($artwork->path);
+            return (new LocalFileResponseFactory())->create(
+                $artwork->path,
+                200,
+                $headers,
+                0,
+                $artwork->fileSize,
+            );
         } catch (Throwable $throwable) {
             if ($throwable instanceof AuthenticationRequired) {
                 return JsonResponseFactory::error('AUTHENTICATION_REQUIRED', '请先登录。', 401, $requestId);
@@ -60,7 +66,7 @@ final class ArtworkController
         }
     }
 
-    /** Returns one original selected album artwork or a non-enumerable 404. */
+    /** 返回当前账号可见的专辑原图；不存在与无权访问统一返回不可枚举的 404。 */
     public function album(Request $request, string $albumId): Response
     {
         $requestId = RequestContext::requestId();
@@ -72,7 +78,13 @@ final class ArtworkController
                 return response('', 304, $headers);
             }
 
-            return response('', 200, $headers)->withFile($artwork->path);
+            return (new LocalFileResponseFactory())->create(
+                $artwork->path,
+                200,
+                $headers,
+                0,
+                $artwork->fileSize,
+            );
         } catch (Throwable $throwable) {
             if ($throwable instanceof AuthenticationRequired) {
                 return JsonResponseFactory::error('AUTHENTICATION_REQUIRED', '请先登录。', 401, $requestId);
@@ -102,7 +114,7 @@ final class ArtworkController
         }
     }
 
-    /** Returns one current-library-authorized artist image or a non-enumerable 404. */
+    /** 返回当前音乐库授权范围内的艺人原图；不存在与无权访问统一返回不可枚举的 404。 */
     public function artist(Request $request, string $artistId): Response
     {
         $requestId = RequestContext::requestId();
@@ -114,7 +126,13 @@ final class ArtworkController
                 return response('', 304, $headers);
             }
 
-            return response('', 200, $headers)->withFile($artwork->path);
+            return (new LocalFileResponseFactory())->create(
+                $artwork->path,
+                200,
+                $headers,
+                0,
+                $artwork->fileSize,
+            );
         } catch (Throwable $throwable) {
             if ($throwable instanceof AuthenticationRequired) {
                 return JsonResponseFactory::error('AUTHENTICATION_REQUIRED', '请先登录。', 401, $requestId);
@@ -145,9 +163,9 @@ final class ArtworkController
     /**
      * 构造原图响应的私有缓存、内容类型和嗅探保护头。
      *
-     * 此处不能预设 Content-Length：`withFile()` 会在 Workerman 编码阶段依据最终文件范围追加
-     * 唯一长度。若业务头先写入同名字段，框架的递归合并会把它变成两个相同响应头，Nginx 会拒绝
-     * 该上游响应并返回 502。文件身份和大小仍由 ArtworkService 在进入控制器前完成严格校验。
+     * 此处不能预设 Content-Length：Go 网关会在解密并复验文件身份后写入，兼容回退的 `withFile()` 也会
+     * 在 Workerman 编码阶段依据最终文件追加。业务层提前写入会产生重复长度或与并发变化后的文件不符。
+     * 文件身份和大小仍由 ArtworkService 先验证，传输边界随后独立复验。
      */
     private function headers(ResolvedArtwork $artwork, string $requestId): array
     {
@@ -162,7 +180,7 @@ final class ArtworkController
         ];
     }
 
-    /** Applies If-None-Match precedence, then second-granularity If-Modified-Since. */
+    /** 按 HTTP 优先级先校验 If-None-Match，再按秒精度校验 If-Modified-Since。 */
     private function isNotModified(Request $request, ResolvedArtwork $artwork): bool
     {
         $ifNoneMatch = trim((string) $request->header('if-none-match', ''));

@@ -6,6 +6,7 @@ namespace app\application\Dlna;
 
 use app\application\Auth\CapabilityResolver;
 use app\application\Library\LibraryAccessResolver;
+use app\application\Media\MediaStreamResolver;
 use app\application\Media\MediaStreamService;
 use app\application\System\PublicUrlConfig;
 use app\http\RequestContext;
@@ -28,11 +29,12 @@ use Symfony\Component\Uid\Ulid;
 final readonly class DlnaTicketService
 {
     public function __construct(
-        private MediaStreamService $streams = new MediaStreamService(),
+        private MediaStreamResolver $streams = new MediaStreamService(),
         private CapabilityResolver $capabilities = new CapabilityResolver(),
         private LibraryAccessResolver $libraries = new LibraryAccessResolver(),
         private AuditLogger $audit = new AuditLogger(),
         private DlnaDeliveryProgressStore $deliveryProgress = new DlnaDeliveryProgressStore(),
+        private DlnaDatabaseWriter $database = new DlnaDatabaseWriter(),
     ) {
     }
 
@@ -63,7 +65,7 @@ final readonly class DlnaTicketService
         }
         $owned = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];
         if (!$this->hasRequiredCapabilities($owned, $format)) {
-            throw new DlnaUnavailable('DLNA_PERMISSION_DENIED', '账号缺少 DLNA 播放、投放或转码能力。');
+            throw new DlnaUnavailable('DLNA_PERMISSION_DENIED', '账号缺少 DLNA 播放或投放能力。');
         }
         $media = $this->streams->resolve($actor, $songId);
         $baseUrl = $this->publicBaseUrl($automaticBaseUrl, $purpose === 'dlna');
@@ -75,7 +77,7 @@ final readonly class DlnaTicketService
         $tokenDigest = $this->digest("ticket\0" . $plainText);
         $deviceDigest = $this->digest("device\0" . $deviceId);
 
-        Db::transaction(function () use (
+        $this->database->run(function () use (
             $actor, $deviceDigest, $expiresAt, $format, $id, $now, $purpose, $requestId, $songId, $tokenDigest,
         ): void {
             // 有界清理只处理过期票据行；已交给音响的 URL 在到期后本就无效，不涉及媒体或网络补偿。
@@ -149,21 +151,37 @@ final readonly class DlnaTicketService
             'libraries' => $this->libraries->resolve($userId, $isSuper),
             'authenticationType' => 'dlna_ticket',
         ];
-        // 高频 Range 拉取只每五分钟更新一次使用时间，减少 SQLite 写锁；失败不影响票据的权限事实。
+        // 高频 Range 拉取只每五分钟更新一次使用时间，减少 SQLite 写锁。该字段不是授权事实；写竞争或
+        // 日志故障均不得阻断已经通过实时权限复验的音频响应，下次 Range 可再次尝试更新时间。
         $lastUsed = $row->last_used_at === null ? 0 : (strtotime((string) $row->last_used_at) ?: 0);
         if ($lastUsed <= time() - 300) {
-            Db::table('dlna_playback_tickets')->where('id', (string) $row->id)->whereNull('revoked_at')
-                ->update(['last_used_at' => $now]);
+            try {
+                $this->database->run(static function () use ($now, $row): void {
+                    Db::table('dlna_playback_tickets')->where('id', (string) $row->id)->whereNull('revoked_at')
+                        ->update(['last_used_at' => $now]);
+                });
+            } catch (DlnaUnavailable) {
+                // DlnaDatabaseWriter 已记录脱敏驱动分类；该可丢失时间戳不再产生第二条含票据上下文的日志。
+            }
         }
         return ['actor' => $actor, 'songId' => (string) $row->song_id,
             'format' => (string) $row->output_format, 'ticketId' => (string) $row->id];
     }
 
-    /** 控制命令失败时撤销尚未过期的票据；撤销是幂等的且不联系 Renderer。 */
+    /**
+     * 控制命令失败时撤销尚未过期的票据。
+     *
+     * 撤销通过 SQLite 写闸门执行且以 revoked_at IS NULL 保持幂等，不联系 Renderer，也不删除媒体。
+     * 瞬时竞争按票据短事务边界重试；耗尽时抛出稳定数据库错误，由调用方作为补偿失败记录，但不得覆盖
+     * 触发补偿的原始 helper/授权异常。
+     */
     public function revoke(string $ticketId): void
     {
-        Db::table('dlna_playback_tickets')->where('id', $ticketId)->whereNull('revoked_at')
-            ->update(['revoked_at' => gmdate('Y-m-d\TH:i:s\Z')]);
+        $now = gmdate('Y-m-d\TH:i:s\Z');
+        $this->database->run(static function () use ($now, $ticketId): void {
+            Db::table('dlna_playback_tickets')->where('id', $ticketId)->whereNull('revoked_at')
+                ->update(['revoked_at' => $now]);
+        });
     }
 
     /**

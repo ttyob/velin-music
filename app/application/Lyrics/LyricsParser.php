@@ -5,13 +5,12 @@ declare(strict_types=1);
 namespace app\application\Lyrics;
 
 /**
- * Converts bounded sidecar bytes into Velin Music's plain, line- or word-synchronized model.
+ * 把有界歌词字节解析为 Velin Music 的普通、逐行或逐字结构。
  *
- * The caller enforces the 1 MiB file limit before reading; this parser repeats a byte/line bound so
- * it is also safe when used by future upload/provider adapters. It accepts BOM-marked UTF-8/UTF-16,
- * strict UTF-8, and a conservative GB18030/BIG-5 fallback through mbstring. Invalid conversion is
- * rejected rather than persisted with replacement characters. Parsing has no filesystem or DB
- * side effects.
+ * 调用方通常已执行 1 MiB 文件限制，但本类仍重复校验字节数、行数和单行长度，使上传、Provider
+ * 与扫描入口共用时不会扩大资源消耗。输入支持带 BOM 的 UTF-8/UTF-16、严格 UTF-8，以及受控的
+ * GB18030/BIG-5 探测；无法无损转换时失败关闭，不使用替换字符保存损坏正文。本类不访问文件系统或
+ * 数据库，失败没有持久化副作用，相同输入必须产生稳定结果。
  */
 final class LyricsParser
 {
@@ -21,9 +20,14 @@ final class LyricsParser
     private const MAX_WORDS = 50_000;
 
     /**
-     * Parses plain text or LRC timestamps, metadata tags, multiple timestamps, and `[offset:]`.
+     * 解析普通文本、LRC 时间戳、头部标签、行首多时间戳与 `[offset:]`。
      *
-     * @throws LyricsParseFailed For oversized, undecodable, binary, or empty documents.
+     * 标准 LRC 的多时间戳只允许连续出现在行首。部分平台会用同样的方括号时间戳在一句内部标记
+     * 字词边界；闭合且单调的时间轴会无损转换为逐字结构，缺少末尾时间或顺序损坏时才移除内部标记
+     * 并按行首时间降级，不能把每个字词时间点展开成重复整句。严格逐字歌词仍使用本项目成对的
+     * Enhanced LRC profile 持久化。
+     *
+     * @throws LyricsParseFailed 输入超限、编码无效、包含二进制内容或没有可显示正文
      */
     public function parse(string $bytes): ParsedLyrics
     {
@@ -69,9 +73,39 @@ final class LyricsParser
                 ++$sequence;
                 continue;
             }
-            preg_match_all('/\[(\d{1,4}):([0-5]\d)(?:[\.:](\d{1,3}))?\]/', $rawLine, $matches, PREG_SET_ORDER);
+            $inlineWords = $this->parseInlineSquareWordLine($rawLine, $offsetMs, $sequence);
+            if ($inlineWords !== null) {
+                $wordCount += count($inlineWords['words']);
+                if ($wordCount > self::MAX_WORDS) {
+                    throw new LyricsParseFailed('LYRICS_TOO_MANY_WORDS', '逐字歌词词项超过安全限制。');
+                }
+                $wordTimed[] = $inlineWords;
+                ++$sequence;
+                continue;
+            }
+            // 只有连续位于行首的时间戳能复用整句。QQ 等来源会把逐字边界继续写在正文中；若对整行
+            // 无锚点匹配，每个边界都会复制一次完整句子，并在扫描导出后形成数百行不可读歌词。
+            $lineMatch = [];
+            $hasTimedPrefix = preg_match(
+                '/^\s*((?:\[\d{1,4}:[0-5]\d(?:[\.:]\d{1,3})?\])+)(.*)$/',
+                $rawLine,
+                $lineMatch,
+            ) === 1;
+            $matches = [];
+            if ($hasTimedPrefix) {
+                preg_match_all(
+                    '/\[(\d{1,4}):([0-5]\d)(?:[\.:](\d{1,3}))?\]/',
+                    (string) $lineMatch[1],
+                    $matches,
+                    PREG_SET_ORDER,
+                );
+            }
             if ($matches !== []) {
-                $content = trim((string) preg_replace('/\[(\d{1,4}):([0-5]\d)(?:[\.:](\d{1,3}))?\]/', '', $rawLine));
+                $content = trim((string) preg_replace(
+                    '/\[\d{1,4}:[0-5]\d(?:[\.:]\d{1,3})?\]/',
+                    '',
+                    (string) $lineMatch[2],
+                ));
                 foreach ($matches as $timestamp) {
                     $milliseconds = (((int) $timestamp[1] * 60) + (int) $timestamp[2]) * 1000;
                     $milliseconds += $this->fractionMs($timestamp[3] ?? '');
@@ -91,7 +125,25 @@ final class LyricsParser
         }
 
         if ($wordTimed !== [] && $timed !== []) {
-            throw new LyricsParseFailed('LYRICS_MIXED_SYNC_KIND', '歌词文件混合了逐行和逐字时间格式。');
+            // 平台方括号格式可能只有个别行缺失最终边界。此时无法让一份歌词同时声明 line/word，
+            // 但所有行都仍有可信的行首时间；统一降为逐行可保住整首正文，也不会伪造缺失词结束时间。
+            // 严格 Enhanced LRC 与逐行格式混用仍失败关闭，因为这通常意味着文件拼接或格式损坏。
+            $onlyInlineSquareWords = array_reduce(
+                $wordTimed,
+                static fn (bool $valid, array $line): bool => $valid && ($line['_inlineSquare'] ?? false) === true,
+                true,
+            );
+            if (!$onlyInlineSquareWords) {
+                throw new LyricsParseFailed('LYRICS_MIXED_SYNC_KIND', '歌词文件混合了逐行和逐字时间格式。');
+            }
+            foreach ($wordTimed as $line) {
+                $timed[] = [
+                    'startMs' => (int) $line['startMs'],
+                    'text' => (string) $line['text'],
+                    '_sequence' => (int) $line['_sequence'],
+                ];
+            }
+            $wordTimed = [];
         }
         if ($wordTimed !== []) {
             usort($wordTimed, static fn (array $left, array $right): int =>
@@ -128,7 +180,7 @@ final class LyricsParser
      * 普通行不含词时间标记时返回 null。只要出现形似词时间的标记，就必须完整满足成对、无额外文本、
      * 时间非重叠和行首范围规则，否则抛出固定错误；禁止把损坏逐字歌词降级成带尖括号的逐行文本。
      *
-     * @return null|array{startMs:int,endMs:int,text:string,words:list<array{startMs:int,endMs:int,text:string}>,_sequence:int}
+     * @return null|array{startMs:int,endMs:int,text:string,words:list<array{startMs:int,endMs:int,text:string}>,_sequence:int,_inlineSquare:bool}
      */
     private function parseEnhancedLine(string $rawLine, int $offsetMs, int $sequence): ?array
     {
@@ -192,6 +244,86 @@ final class LyricsParser
             'text' => $joined,
             'words' => $words,
             '_sequence' => $sequence,
+            '_inlineSquare' => false,
+        ];
+    }
+
+    /**
+     * 把平台常见的 `[词开始]文本[下一词开始]` 行内时间轴转换为逐字结构。
+     *
+     * 输入必须以行时间开始、正文中至少还有一个方括号时间戳，最后一个时间戳后不得残留正文；每个
+     * 非空片段使用相邻两个时间戳作为起止范围。连续时间戳形成的无文本间奏被跳过，但时间必须保持
+     * 单调。无法证明每段结束时间时返回 null，由调用方移除行内标记并降级为逐行歌词，不抛出错误，
+     * 以兼容平台历史数据同时避免伪造逐字时间。该方法没有文件或数据库副作用。
+     *
+     * @return null|array{startMs:int,endMs:int,text:string,words:list<array{startMs:int,endMs:int,text:string}>,_sequence:int,_inlineSquare:bool}
+     */
+    private function parseInlineSquareWordLine(string $rawLine, int $offsetMs, int $sequence): ?array
+    {
+        $tokenPattern = '/\[(\d{1,4}):([0-5]\d)(?:[\.:](\d{1,3}))?\]/';
+        preg_match_all($tokenPattern, $rawLine, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
+        if (count($matches) < 2) {
+            return null;
+        }
+        $firstOffset = (int) $matches[0][0][1];
+        if (trim(substr($rawLine, 0, $firstOffset)) !== '') {
+            return null;
+        }
+        $last = $matches[array_key_last($matches)];
+        $lastEnd = (int) $last[0][1] + strlen((string) $last[0][0]);
+        if (trim(substr($rawLine, $lastEnd)) !== '') {
+            return null;
+        }
+
+        $words = [];
+        $text = '';
+        $lineStart = null;
+        $lineEnd = null;
+        $previousTimestamp = -1;
+        for ($index = 0; $index < count($matches); ++$index) {
+            $token = $matches[$index];
+            $timestamp = max(0, $this->timestampMs(
+                (string) $token[1][0],
+                (string) $token[2][0],
+                (string) ($token[3][0] ?? ''),
+            ) + $offsetMs);
+            if ($timestamp < $previousTimestamp) {
+                return null;
+            }
+            $previousTimestamp = $timestamp;
+            if ($index === count($matches) - 1) {
+                break;
+            }
+            $next = $matches[$index + 1];
+            $contentStart = (int) $token[0][1] + strlen((string) $token[0][0]);
+            $content = substr($rawLine, $contentStart, (int) $next[0][1] - $contentStart);
+            if ($content === '') {
+                continue;
+            }
+            $nextTimestamp = max(0, $this->timestampMs(
+                (string) $next[1][0],
+                (string) $next[2][0],
+                (string) ($next[3][0] ?? ''),
+            ) + $offsetMs);
+            if ($nextTimestamp <= $timestamp || !mb_check_encoding($content, 'UTF-8')) {
+                return null;
+            }
+            $lineStart ??= $timestamp;
+            $lineEnd = $nextTimestamp;
+            $text .= $content;
+            $words[] = ['startMs' => $timestamp, 'endMs' => $nextTimestamp, 'text' => $content];
+        }
+        if ($words === [] || $lineStart === null || $lineEnd === null || trim($text) === '') {
+            return null;
+        }
+
+        return [
+            'startMs' => $lineStart,
+            'endMs' => $lineEnd,
+            'text' => $text,
+            'words' => $words,
+            '_sequence' => $sequence,
+            '_inlineSquare' => true,
         ];
     }
 

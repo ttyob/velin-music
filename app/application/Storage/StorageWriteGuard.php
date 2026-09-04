@@ -15,8 +15,10 @@ use Illuminate\Database\QueryException;
  */
 final readonly class StorageWriteGuard
 {
-    public function __construct(private StorageGovernanceService $governance = new StorageGovernanceService())
-    {
+    public function __construct(
+        private StorageGovernanceService $governance = new StorageGovernanceService(),
+        private StorageCapacityProbe $capacityProbe = new StorageCapacityProbe(),
+    ) {
     }
 
     /** 新上传会话按完整声明大小预留，防止清单建立后必然穿透安全余量。 */
@@ -81,9 +83,10 @@ final readonly class StorageWriteGuard
         }
         if (!$capacitySensitive) return;
 
-        $total = @disk_total_space($existing);
-        $free = @disk_free_space($existing);
-        if (!is_float($total) || !is_float($free) || $total <= 0) throw new StorageWriteBlocked('STORAGE_CAPACITY_UNKNOWN');
+        $capacity = $this->capacityProbe->bytes($existing);
+        if ($capacity === null) throw new StorageWriteBlocked('STORAGE_CAPACITY_UNKNOWN');
+        $total = $capacity['total'];
+        $free = $capacity['free'];
         $projected = $free - $additionalBytes;
         if ($projected <= (int) $policy['safetyReserveBytes']
             || ($projected / $total) * 100 < (int) $policy['criticalFreePercent']) {

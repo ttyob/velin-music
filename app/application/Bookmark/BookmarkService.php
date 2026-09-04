@@ -6,21 +6,26 @@ namespace app\application\Bookmark;
 
 use app\application\Media\MediaQueryService;
 use app\application\Media\SongDuplicateRedirectResolver;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use stdClass;
 use support\Db;
 
 /**
- * Owns isolated song bookmarks shared by the Web UI and Subsonic compatibility layer.
+ * 管理 Web 与 Subsonic 兼容层共享、按用户隔离的歌曲书签。
  *
- * Every read that returns song metadata applies MediaQueryService's live library/file scope before
- * pagination. Saves re-prove the song inside the write transaction, use one row per user/song, and
- * never store paths. Web callers use optimistic versions; legacy Subsonic callers intentionally use
- * last-command-wins because that protocol has no version precondition. Deletes can remove the
- * current user's stale hidden bookmark without proving media access and return no media metadata.
+ * 返回歌曲资料前必须应用实时音乐库和文件权限；保存会在短事务内重新证明歌曲可见性，并以用户/歌曲唯一
+ * 行和乐观版本防止覆盖。旧 Subsonic 协议没有版本前置条件，只能使用最后命令生效语义。删除允许用户在
+ * 撤权后清理自己的隐藏书签，但不返回媒体资料。成功提交后只向 Redis 发布不含评论正文的有限期摘要，
+ * Redis 故障不回滚个人书签；插件不得把通知当作书签事实来源。
  */
 final readonly class BookmarkService
 {
-    public function __construct(private MediaQueryService $media = new MediaQueryService())
+    /** 构建权限查询和提交后事件发布依赖；构造阶段不访问数据库或 Redis。 */
+    public function __construct(
+        private MediaQueryService $media = new MediaQueryService(),
+        private PluginEventPublisher $events = new PluginEventPublisher(),
+    )
     {
     }
 
@@ -78,17 +83,14 @@ final readonly class BookmarkService
     }
 
     /**
-     * Creates or updates one bookmark under Web versioning or legacy overwrite semantics.
+     * 按 Web 乐观版本或旧协议覆盖语义创建、更新一个书签。
      *
-     * Authorization, duration bounds, version comparison, and mutation occur in one transaction.
-     * `expectedVersion=0` requires absence; a positive value must equal the current row. Null is
-     * reserved for Subsonic and increments whichever current version exists. Position may equal a
-     * known song duration but never exceed it; duration zero means unknown and only the validated
-     * non-negative protocol bound applies. The operation is idempotent in observable state; a repeated
-     * legacy write still advances version because legacy clients never observe that internal field.
+     * 授权、时长上限、版本比较和写入位于同一事务。`expectedVersion=0` 要求当前不存在，正数必须等于
+     * 当前版本，null 仅供没有版本字段的 Subsonic 使用。位置可等于已知时长但不能超过；时长为零时只执行
+     * 协议非负上限。事务提交后发布 `bookmark.changed.v1`，仅包含 saved、位置和新版本，不包含评论。
      *
-     * @param array<string, mixed> $actor Authenticated principal whose user ID owns the row.
-     * @return array<string, mixed> Complete authorized bookmark projection after commit.
+     * @param array<string, mixed> $actor 用户 ID 拥有该行的已认证身份。
+     * @return array<string, mixed> 提交后重新授权的完整书签投影。
      */
     public function save(array $actor, BookmarkInput $input): array
     {
@@ -137,23 +139,28 @@ final readonly class BookmarkService
             }
         });
 
-        return $this->one($actor, $songId)
+        $saved = $this->one($actor, $songId)
             ?? throw new BookmarkNotFound('Saved bookmark is no longer authorized.');
+        $this->events->publish(PluginDomainEvent::BOOKMARK_CHANGED, 'song', $songId, 'user', $userId, [
+            'action' => 'saved',
+            'positionMs' => (int) $saved['positionMs'],
+            'version' => (int) $saved['version'],
+        ]);
+        return $saved;
     }
 
     /**
-     * Deletes only the authenticated user's row, with optional Web optimistic locking.
+     * 只删除当前认证用户自己的书签，并可执行 Web 乐观版本校验。
      *
-     * Null expectedVersion is the idempotent Subsonic form: an absent bookmark is successful. Web
-     * deletion requires the exact positive version and reports a conflict for absent/stale state.
-     * Media authorization is intentionally not required so a user can remove stale personal data
-     * after losing library access; no song projection is returned.
+     * expectedVersion 为 null 是 Subsonic 幂等形式，不存在也成功；Web 必须提交精确正版本，不存在或陈旧
+     * 均冲突。删除故意不要求当前媒体权限，使撤权用户仍可清理个人数据。只有实际删除一行时才在事务提交
+     * 后发布 deleted 摘要；幂等空删除不制造虚假事件，Redis 失败不恢复已删除书签。
      */
     public function delete(array $actor, string $songId, ?int $expectedVersion): void
     {
         $songId = (new SongDuplicateRedirectResolver())->resolve($songId);
         $userId = (string) $actor['id'];
-        Db::transaction(function () use ($expectedVersion, $songId, $userId): void {
+        $deleted = Db::transaction(function () use ($expectedVersion, $songId, $userId): bool {
             /** @var stdClass|null $row */
             $row = Db::table('user_song_bookmarks')->where('user_id', $userId)
                 ->where('song_id', $songId)->first(['version']);
@@ -161,7 +168,7 @@ final readonly class BookmarkService
                 if ($expectedVersion !== null) {
                     throw new BookmarkConflict('书签已被删除，请重新加载。');
                 }
-                return;
+                return false;
             }
             $version = (int) $row->version;
             if ($expectedVersion !== null && $expectedVersion !== $version) {
@@ -172,7 +179,13 @@ final readonly class BookmarkService
             if ($deleted !== 1) {
                 throw new BookmarkConflict('书签已在其他页面或客户端更新，请重新加载。');
             }
+            return true;
         });
+        if ($deleted) {
+            $this->events->publish(PluginDomainEvent::BOOKMARK_CHANGED, 'song', $songId, 'user', $userId, [
+                'action' => 'deleted',
+            ]);
+        }
     }
 
     /**

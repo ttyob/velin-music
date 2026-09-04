@@ -12,6 +12,7 @@ use app\application\System\PublicUrlConfig;
 use app\http\TranscodeResponse;
 use app\http\RequestContext;
 use app\infrastructure\Audit\AuditLogger;
+use app\infrastructure\Database\SqliteWriteGate;
 use stdClass;
 use support\Db;
 use Symfony\Component\Uid\Ulid;
@@ -37,6 +38,7 @@ final readonly class ExternalPlaybackTicketService
         private UserActorProjector $actors = new UserActorProjector(),
         private AuditLogger $audit = new AuditLogger(),
         private SubsonicTranscodeService $transcodes = new SubsonicTranscodeService(),
+        private SqliteWriteGate $writeGate = new SqliteWriteGate(),
     ) {
     }
 
@@ -55,7 +57,7 @@ final readonly class ExternalPlaybackTicketService
         $plain = 'velin_ext_' . $id . '_' . $secret;
         $now = gmdate('Y-m-d\TH:i:s\Z');
         $startsBefore = gmdate('Y-m-d\TH:i:s\Z', time() + 300);
-        Db::transaction(function () use ($actor, $format, $id, $mime, $now, $payload, $requestId,
+        $this->writeGate->run(fn () => Db::transaction(function () use ($actor, $format, $id, $mime, $now, $payload, $requestId,
             $songId, $startsBefore, $plain, $supportsRange): void {
             // 清理仅限最多一百条从未开始或已经结束的票据行，不触碰媒体、接收器和播放历史。
             $expired = Db::table('external_playback_tickets')->where(static function ($query) use ($now): void {
@@ -76,7 +78,7 @@ final readonly class ExternalPlaybackTicketService
             $this->audit->record((string) $actor['id'], 'external_playback.ticket.create',
                 'external_playback_ticket', $id, 'success', $requestId,
                 ['protocol' => $payload['protocol'], 'format' => $format]);
-        });
+        }));
         return ['url' => $baseUrl . '/external/v1/streams/' . rawurlencode($plain), 'mimeType' => $mime,
             'contentLength' => $format === 'raw' ? $media->fileSize : null,
             'supportsRange' => $supportsRange, 'expiresAt' => $startsBefore];
@@ -151,10 +153,9 @@ final readonly class ExternalPlaybackTicketService
         $this->streams->resolve($actor, (string) $row->song_id);
         if ($row->started_at === null) {
             $expires = gmdate('Y-m-d\TH:i:s\Z', time() + 7200);
-            Db::table('external_playback_tickets')->where('id', (string) $row->id)
-                ->whereNull('started_at')->where('starts_before', '>', $now)->whereNull('revoked_at')->update([
-                    'started_at' => $now, 'expires_at' => $expires, 'last_used_at' => $now,
-                ]);
+            $this->writeGate->run(fn (): int => Db::table('external_playback_tickets')
+                ->where('id', (string) $row->id)->whereNull('started_at')->where('starts_before', '>', $now)
+                ->whereNull('revoked_at')->update(['started_at' => $now, 'expires_at' => $expires, 'last_used_at' => $now]));
             /** @var stdClass|null $row */
             $row = Db::table('external_playback_tickets')->where('id', (string) $row->id)->first();
             if (!$row instanceof stdClass || $row->started_at === null || $row->revoked_at !== null) {
@@ -162,8 +163,9 @@ final readonly class ExternalPlaybackTicketService
             }
         }
         $lastUsed = $row->last_used_at === null ? 0 : (strtotime((string) $row->last_used_at) ?: 0);
-        if ($lastUsed <= time() - 300) Db::table('external_playback_tickets')->where('id', (string) $row->id)
-            ->whereNull('revoked_at')->update(['last_used_at' => $now]);
+        if ($lastUsed <= time() - 300) $this->writeGate->run(fn (): int =>
+            Db::table('external_playback_tickets')->where('id', (string) $row->id)
+                ->whereNull('revoked_at')->update(['last_used_at' => $now]));
         return ['actor' => $actor, 'songId' => (string) $row->song_id,
             'format' => (string) $row->output_format, 'mimeType' => (string) $row->mime_type,
             'supportsRange' => (int) $row->supports_range === 1, 'ticketId' => (string) $row->id];

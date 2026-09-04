@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\Playlist;
 
+use app\application\Artist\ArtistNameIdentityNormalizer;
 use app\application\ResourcePlugin\Contract\ExternalMusicPluginRegistry;
 use app\application\ResourcePlugin\PhpResourcePluginRegistry;
 use app\application\Scrape\ChineseQueryVariantNormalizer;
@@ -28,6 +29,7 @@ final readonly class PlaylistAutoCompletionService
         private ExternalMusicPluginRegistry $registry = new PhpResourcePluginRegistry(),
         private AuditLogger $audit = new AuditLogger(),
         private ChineseQueryVariantNormalizer $identityNormalizer = new ChineseQueryVariantNormalizer(),
+        private ArtistNameIdentityNormalizer $artistNames = new ArtistNameIdentityNormalizer(),
     ) {
     }
 
@@ -369,10 +371,9 @@ final readonly class PlaylistAutoCompletionService
             fn (string $artist): string => $this->identityNormalizer->simplifyText($artist),
             $this->artists($row->source_artists_json),
         )));
-        $artistCandidates = array_values(array_unique(array_filter(array_map(
-            fn (string $artist): string => $normalizer->normalize($artist),
-            $artists,
-        ), static fn (string $artist): bool => $artist !== '')));
+        $artistCandidates = [];
+        foreach ($artists as $artist) $artistCandidates = [...$artistCandidates, ...$this->artistNames->lookupKeys($artist)];
+        $artistCandidates = array_values(array_unique($artistCandidates));
         $query = Db::table('media_songs as songs')->where('songs.library_id', (string) $row->library_id)
             ->whereIn('songs.normalized_title', $titleCandidates)
             ->join('library_file_inventory as files', 'files.id', '=', 'songs.inventory_file_id')

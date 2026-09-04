@@ -8,7 +8,7 @@ use Symfony\Component\Process\Process;
 use Throwable;
 
 /**
- * 使用部署内固定 OpenCC 把文件名查询变体转换为简体中文，原始扫描事实保持不变。
+ * 使用部署内固定 OpenCC `tw2s` 把查询身份转换为简体中文，原始扫描事实保持不变。
  *
  * 可执行文件和词典路径由部署固定，浏览器与音乐库配置均不能覆盖。整首歌曲的最多两个变体以一个有界
  * JSON 文档完成转换，避免逐字段启动进程；启动失败、超时、输出损坏或开发环境未安装 OpenCC 时原样
@@ -36,7 +36,7 @@ final readonly class ChineseQueryVariantNormalizer
     public function simplify(array $variants): array
     {
         $binary = $this->binaryPath ?? base_path('bin/opencc');
-        $config = $this->configPath ?? base_path('bin/opencc-data/t2s.json');
+        $config = $this->configPath ?? base_path('bin/opencc-data/tw2s.json');
         if (!is_file($binary) || !is_executable($binary) || !is_file($config)) return $variants;
         try {
             $input = json_encode($variants, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);

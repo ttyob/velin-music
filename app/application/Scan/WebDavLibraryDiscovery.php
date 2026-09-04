@@ -29,9 +29,11 @@ final class WebDavLibraryDiscovery
         string $libraryId,
         RemoteLibraryClient $client,
         callable $checkpoint,
+        ?string $relativePath = null,
     ): Generator {
-        $queue = [['', 0]];
-        $visitedDirectories = ['' => true];
+        $start = $relativePath ?? '';
+        $queue = [[$start, 0]];
+        $visitedDirectories = [$start => true];
         $processed = 0;
         $ignored = 0;
         $checkpoint(0);

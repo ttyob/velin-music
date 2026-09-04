@@ -6,6 +6,8 @@ namespace app\application\Playback;
 
 use app\application\Media\MediaQueryService;
 use app\application\Scrobble\ScrobbleOutbox;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use DateTimeImmutable;
 use DateTimeZone;
 use PDO;
@@ -28,6 +30,7 @@ final class PlaybackEventService
         private readonly ScrobbleOutbox $scrobbleOutbox = new ScrobbleOutbox(),
         private readonly PlaybackPrefetchJobService $prefetch = new PlaybackPrefetchJobService(),
         private readonly ListeningTimeService $listeningTime = new ListeningTimeService(),
+        private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
     ) {
     }
 
@@ -226,6 +229,24 @@ final class PlaybackEventService
             }
             $pdo->exec('COMMIT');
             $transactionOpen = false;
+
+            if ($countedNow) {
+                // 只对首次达到服务端有效播放阈值的事件通知插件；客户端 completed 但未达到阈值不伪造完成。
+                // Redis 写发生在 COMMIT 之后，失败不会回滚播放统计或 Scrobble outbox。
+                $this->pluginEvents->publish(
+                    PluginDomainEvent::PLAYBACK_COMPLETED,
+                    'song',
+                    $songId,
+                    'user',
+                    $userId,
+                    [
+                        'playbackId' => $input->playbackId,
+                        'positionMs' => (int) $event['position_ms'],
+                        'listenedMs' => $listenedMs,
+                        'playCount' => $playCount,
+                    ],
+                );
+            }
 
             return $this->resultFromStored((object) $event, $input->playbackId, false);
         } catch (Throwable $throwable) {

@@ -8,17 +8,17 @@ use RuntimeException;
 use Throwable;
 
 /**
- * 配置并报告部署方确认的容器媒体与刮削缓存目录。
+ * 配置并报告部署方确认的容器音乐库与刮削缓存目录。
  *
- * 本服务只由专用扫描 Worker 调用，HTTP 请求不会触发。新缓存根来自部署环境但必须规范化为 `/media`
- * 子目录；默认固定为 `/media/cache/scrape`。服务以 0750 创建缺失目录，不修改已有所有者/权限，不删除
- * 内容，也不跟随软链接。新安装只创建 library/cache；升级环境既不探测也不删除遗留 work 目录。
+ * 本服务只由专用扫描 Worker 调用，HTTP 请求不会触发。音乐库固定为 `/storage/music`，可重建缓存固定
+ * 为 `/data/cache/scrape`；两者由不同职责的挂载根承载。服务以 0750 创建缺失目录，不修改已有
+ * 所有者/权限，不删除内容，也不跟随软链接。每次实际发布仍须重验真实路径、权限和文件身份。
  * 每次实际发布仍须重验真实路径、包含关系、权限和文件身份。
  */
 final class DefaultMediaStorageProvisioner
 {
-    public const LIBRARY_PATH = '/media/library';
-    public const SCRAPE_CACHE_PATH = '/media/cache/scrape';
+    public const LIBRARY_PATH = StorageLayout::LIBRARY_ROOT;
+    public const SCRAPE_CACHE_PATH = StorageLayout::SCRAPE_CACHE_ROOT;
 
     /**
      * 创建缺失的默认媒体根与刮削缓存根。
@@ -30,7 +30,7 @@ final class DefaultMediaStorageProvisioner
     {
         try {
             $library = $this->ensureDirectory(self::LIBRARY_PATH, false);
-            $cache = $this->ensureDirectory($this->scrapeCachePath(), true);
+            $cache = $this->ensureDirectory(self::SCRAPE_CACHE_PATH, true);
             $this->assertDistinctNonOverlapping($library, $cache);
         } catch (Throwable $throwable) {
             throw new RuntimeException('Default media storage provisioning failed.', previous: $throwable);
@@ -49,7 +49,7 @@ final class DefaultMediaStorageProvisioner
     {
         return [
             'library' => $this->inspect(self::LIBRARY_PATH, false),
-            'cache' => $this->inspect($this->scrapeCachePath(), true),
+            'cache' => $this->inspect(self::SCRAPE_CACHE_PATH, true),
         ];
     }
 
@@ -81,23 +81,6 @@ final class DefaultMediaStorageProvisioner
         if ($library === $cache || str_starts_with($libraryPrefix, $cachePrefix) || str_starts_with($cachePrefix, $libraryPrefix)) {
             throw new RuntimeException('Default library and scrape cache directories overlap.');
         }
-    }
-
-    /**
-     * 返回部署配置的缓存根，并在创建前按字符串边界拒绝任意路径。
-     *
-     * 目录可能尚不存在，因此不能先依赖 realpath。只允许规范的 `/media` 后代且拒绝 `.`、`..`、NUL、
-     * 根目录和尾部分隔符别名；Docker Compose 固定传入默认值，裸机部署可以选择另一个 `/media` 子目录。
-     */
-    private function scrapeCachePath(): string
-    {
-        $path = rtrim((string) (getenv('VELIN_SCRAPE_CACHE_PATH') ?: self::SCRAPE_CACHE_PATH), DIRECTORY_SEPARATOR);
-        if ($path === '' || str_contains($path, "\0") || !str_starts_with($path, '/media/')
-            || preg_match('#(?:^|/)(?:\.|\.\.)(?:/|$)#', $path) === 1) {
-            throw new RuntimeException('Scrape cache path must be a normalized /media descendant.');
-        }
-
-        return $path;
     }
 
     /** @return array{path: string, exists: bool, readable: bool, writable: bool} */

@@ -72,7 +72,7 @@ final class DlnaStreamController
                 $length,
                 $ticket['ticketId'],
             );
-            // WebDAV marker 由远端 runner 安装投递观察；本地 withFile 仍在这里使用最终框架头长度。
+            // WebDAV marker 由远端 runner 安装投递观察；本地 DLNA 明确不走 Go，继续在此观察最终头长度。
             if ($media->source->localPath() !== null && $request->connection !== null) {
                 DlnaDeliveryObserver::start(
                     $request->connection,

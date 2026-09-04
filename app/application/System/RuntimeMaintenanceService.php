@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace app\application\System;
 
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
+use app\application\Storage\StorageLayout;
 use app\infrastructure\Audit\AuditLogger;
 use Throwable;
 
@@ -63,14 +66,32 @@ final readonly class RuntimeMaintenanceService
 
     private string $runtimeRoot;
 
+    /**
+     * 固化清理服务唯一允许遍历的运行目录。
+     *
+     * 测试注入和 `VELIN_RUNTIME_PATH` 属于调用方配置，必须保持原路径并由后续身份校验拒绝符号链接。
+     * Docker 镜像内的 `/app/runtime` 则是应用只读层预置的兼容入口：仅当该链接实时解析为固定
+     * `/data/runtime` 时转换为真实目录，其他目标、断链或非目录仍失败关闭。构造过程不创建目录、不扫描
+     * 文件，也不修改清理锁；因此容器重启和重复实例化均没有文件副作用。
+     */
     public function __construct(
         ?string $runtimeRoot = null,
         private AuditLogger $audit = new AuditLogger(),
+        private PluginEventPublisher $events = new PluginEventPublisher(),
     ) {
-        $this->runtimeRoot = rtrim(
-            $runtimeRoot ?? (string) (getenv('VELIN_RUNTIME_PATH') ?: base_path('runtime')),
-            DIRECTORY_SEPARATOR,
-        );
+        $configuredRoot = getenv('VELIN_RUNTIME_PATH');
+        $selectedRoot = $runtimeRoot;
+        if ($selectedRoot === null && is_string($configuredRoot) && $configuredRoot !== '') {
+            $selectedRoot = $configuredRoot;
+        }
+        if ($selectedRoot === null) {
+            $defaultRoot = base_path('runtime');
+            $resolvedDefaultRoot = realpath($defaultRoot);
+            $selectedRoot = is_link($defaultRoot) && $resolvedDefaultRoot === StorageLayout::RUNTIME_ROOT
+                ? StorageLayout::RUNTIME_ROOT
+                : $defaultRoot;
+        }
+        $this->runtimeRoot = rtrim($selectedRoot, DIRECTORY_SEPARATOR);
     }
 
     /**
@@ -137,6 +158,20 @@ final readonly class RuntimeMaintenanceService
             $requestId,
             [
                 'categories' => implode(',', $selected),
+                'deletedFileCount' => $deletedFiles,
+                'deletedBytes' => $deletedBytes,
+                'failedFileCount' => $failedFiles,
+            ],
+        );
+
+        $this->events->publish(
+            PluginDomainEvent::RUNTIME_MAINTENANCE_COMPLETED,
+            'runtime_maintenance',
+            $requestId,
+            'user',
+            $actorUserId,
+            [
+                'categories' => $selected,
                 'deletedFileCount' => $deletedFiles,
                 'deletedBytes' => $deletedBytes,
                 'failedFileCount' => $failedFiles,

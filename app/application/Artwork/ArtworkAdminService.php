@@ -25,6 +25,7 @@ final class ArtworkAdminService
     public function __construct(
         private readonly AuditLogger $audit = new AuditLogger(),
         private readonly ArtworkCandidateImageNormalizer $normalizer = new ArtworkCandidateImageNormalizer(),
+        private readonly ArtworkBlobStore $blobs = new ArtworkBlobStore(),
     ) {}
 
     /** 返回指定实体/库的自动来源摘要、手工候选和当前版本化选择，不返回图片字节。 */
@@ -116,15 +117,23 @@ final class ArtworkAdminService
         $id = (string) new Ulid();
         $now = gmdate('Y-m-d\TH:i:s\Z');
         Db::transaction(function () use ($actor, $crop, $entityId, $id, $normalized, $requestId, $scope, $type, $now): void {
+            $digest = hash('sha256', $normalized);
+            $candidateBytes = $this->blobs->put(
+                $normalized,
+                'image/webp',
+                ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
+                ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
+                $digest,
+            );
             Db::table('media_manual_artwork_candidates')->insert([
                 'id' => $id, 'song_id' => $type === 'song' ? $entityId : null,
                 'album_id' => $type === 'album' ? $entityId : null,
                 'artist_id' => $type === 'artist' ? $entityId : null, 'library_id' => $scope['library']['id'],
                 'created_by' => (string) $actor['id'], 'mime_type' => 'image/webp',
-                'image_bytes' => $normalized, 'byte_size' => strlen($normalized),
+                'image_bytes' => $candidateBytes, 'byte_size' => strlen($normalized),
                 'width' => ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
                 'height' => ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
-                'content_sha256' => hash('sha256', $normalized), 'crop_x' => $crop['x'], 'crop_y' => $crop['y'],
+                'content_sha256' => $digest, 'crop_x' => $crop['x'], 'crop_y' => $crop['y'],
                 'crop_width' => $crop['width'], 'crop_height' => $crop['height'], 'created_at' => $now,
             ]);
             $this->audit->record((string) $actor['id'], 'artwork.candidate.upload', $type, $entityId,
@@ -200,8 +209,9 @@ final class ArtworkAdminService
         $type = $this->rowType($row);
         $entityId = (string) ($row->song_id ?? $row->album_id ?? $row->artist_id);
         $this->scope($actor, $type, $entityId, (string) $row->library_id);
-        $bytes = (string) $row->image_bytes;
-        if (strlen($bytes) !== (int) $row->byte_size || !hash_equals((string) $row->content_sha256, hash('sha256', $bytes))) {
+        try {
+            $bytes = $this->blobs->bytes($row);
+        } catch (\RuntimeException) {
             throw new ArtworkAdminConflict('封面候选存储校验失败。');
         }
         return ['bytes' => $bytes, 'mimeType' => (string) $row->mime_type,

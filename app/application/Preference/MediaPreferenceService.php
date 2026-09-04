@@ -6,6 +6,8 @@ namespace app\application\Preference;
 
 use app\application\Media\MediaQueryService;
 use app\application\Media\SongDuplicateRedirectResolver;
+use app\application\ResourcePlugin\Contract\PluginDomainEvent;
+use app\application\ResourcePlugin\PluginEventPublisher;
 use stdClass;
 use support\Db;
 
@@ -18,6 +20,11 @@ use support\Db;
  */
 final class MediaPreferenceService
 {
+    /** 注入提交后事件发布器；构造过程不连接 Redis，收藏事务仍由本服务独立拥有。 */
+    public function __construct(private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher())
+    {
+    }
+
     /**
      * 设置或清除一个已授权媒体对象的收藏状态。
      *
@@ -107,7 +114,7 @@ final class MediaPreferenceService
         }
         $userId = (string) ($actor['id'] ?? '');
 
-        return Db::transaction(function () use ($favorite, $prepared, $userId): array {
+        $results = Db::transaction(function () use ($favorite, $prepared, $userId): array {
             $results = [];
             foreach ($prepared as [$type, $mediaId, $table, $column]) {
                 $results[] = $this->mutateStored($userId, $type, $mediaId, $table, $column, $favorite);
@@ -115,6 +122,18 @@ final class MediaPreferenceService
 
             return $results;
         });
+        foreach ($results as $result) {
+            // 批量收藏已整体提交后再逐项通知；事件不携带媒体标题、库路径或其他账号信息。
+            $this->pluginEvents->publish(
+                PluginDomainEvent::FAVORITE_CHANGED,
+                'favorite',
+                (string) $result['mediaId'],
+                'user',
+                $userId,
+                ['mediaType' => (string) $result['type'], 'favorite' => (bool) $result['favorite']],
+            );
+        }
+        return $results;
     }
 
     /**

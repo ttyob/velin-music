@@ -14,13 +14,13 @@ use support\Request;
 use support\Response;
 use Throwable;
 
-/** Exposes one read-only, capability-filtered administration health snapshot. */
+/** 对同源后台 Session 暴露一份按 capability 裁剪的只读健康快照。 */
 final class OverviewController
 {
     /**
-     * Returns HTTP 401 for invalid Session, 403 without any management capability, and otherwise a
-     * partial snapshot whose failed probes remain explicit unknown modules. No CSRF is required for
-     * this GET and the operation never enqueues scans or touches media files.
+     * Session 无效返回 401，没有任何后台能力返回 403；其余情况返回部分快照，单探针失败明确标为 unknown。
+     * GET 不要求 CSRF 且不排队扫描、不修改文件。自动备份汇总仅对 manage_system 出现，并由领域服务保证
+     * 不包含路径、文件名、摘要、下载、创建或恢复能力；控制器不得根据请求参数选择备份目录。
      */
     public function show(Request $request): Response
     {

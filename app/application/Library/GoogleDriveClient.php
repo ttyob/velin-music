@@ -510,7 +510,7 @@ final class GoogleDriveClient implements RemoteLibraryClient, WritableRemoteLibr
     {
         if (is_string($this->accessToken) && time() < $this->tokenExpiresAt) return $this->accessToken;
         try {
-            $response = $this->http->request('POST', 'https://oauth2.googleapis.com/token', [
+            $response = $this->http->request('POST', 'https://oauth2.googleapis.com/token', NetworkProxyRequestOptions::apply([
                 'form_params' => [
                     'client_id' => $this->clientId,
                     'client_secret' => $this->clientSecret,
@@ -519,7 +519,7 @@ final class GoogleDriveClient implements RemoteLibraryClient, WritableRemoteLibr
                 ],
                 'allow_redirects' => false, 'http_errors' => false, 'verify' => true,
                 'connect_timeout' => 10, 'timeout' => 20,
-            ]);
+            ], $this->proxy));
         } catch (Throwable) {
             throw new GoogleDriveUnavailable('GOOGLE_DRIVE_AUTH_FAILED', '无法完成 Google Drive 认证。');
         }

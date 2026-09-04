@@ -49,7 +49,7 @@ final class MediaMetadataService
         if ($libraryId !== null && !isset($libraries[$libraryId])) throw new MediaMetadataInvalid('音乐库筛选无效。');
         if ($libraries === []) return $this->emptyPage($limit, $offset, []);
 
-        $query = $this->scopedSongs(array_keys($libraries));
+        $query = $this->scopedSongs(array_keys($libraries), $state === 'file_missing');
         if ($libraryId !== null) $query->where('songs.library_id', $libraryId);
         if ($search !== null) {
             $pattern = '%' . $this->escapeLike($search) . '%';
@@ -78,6 +78,8 @@ final class MediaMetadataService
             $lyrics->selectRaw('1')->from('media_lyrics as state_lyrics')
                 ->whereColumn('state_lyrics.song_id', 'songs.id');
         });
+        elseif ($state === 'artwork_missing') $this->applyMissingArtworkFilter($query);
+        elseif ($state === 'file_missing') $query->where('files.status', 'missing');
         if ($missingField !== null) {
             $query->where(function (Builder $missing) use ($missingField): void {
                 $missing->whereNotExists(function (Builder $fields) use ($missingField): void {
@@ -98,6 +100,7 @@ final class MediaMetadataService
             'songs.track_number', 'songs.track_total', 'songs.disc_number', 'songs.disc_total',
             'songs.release_date', 'songs.isrc',
             'albums.title as album_title', 'libraries.id as library_id', 'libraries.name as library_name',
+            'files.status as file_status', 'files.metadata_status',
         ])->all();
         $songIds = array_map(static fn (stdClass $row): string => (string) $row->id, $rows);
         $artists = $this->artistNames($songIds);
@@ -120,6 +123,8 @@ final class MediaMetadataService
                     'isrc' => $row->isrc === null ? null : (string) $row->isrc,
                     'genres' => $genres[(string) $row->id] ?? [],
                     'lyrics' => $lyric,
+                    'fileStatus' => (string) $row->file_status,
+                    'metadataStatus' => (string) $row->metadata_status,
                 ];
             }, $rows),
             'total' => $total, 'limit' => $limit, 'offset' => $offset,
@@ -184,7 +189,10 @@ final class MediaMetadataService
     }
 
     /**
-     * 清除指定手工值，按 raw > scraped 回退；来源事实和历史记录始终保留。
+     * 清除指定手工值，并按字段级来源规则回退；来源事实和历史记录始终保留。
+     *
+     * 普通字段回退顺序为 raw > scraped，专辑与发行日期回退顺序为 scraped > raw；`unlock` 决定是否
+     * 同时解除锁定。版本任一不匹配时整批回滚，不会产生部分字段成功，专辑关系迁移也由同一事务保护。
      *
      * @param list<array{field:string,version:int,unlock?:bool}> $changes
      * @return array<string,mixed>
@@ -204,8 +212,10 @@ final class MediaMetadataService
             foreach ($normalized as $change) {
                 $before = $states[$change['field']] ?? throw new MediaMetadataConflict('字段状态不存在。');
                 if ($before['version'] !== $change['version']) throw new MediaMetadataConflict('字段版本已变化。');
-                $source = $this->valuePresent($before['raw'], $change['field'])
-                    ? 'raw' : ($before['scraped'] !== null ? 'scraped' : 'raw');
+                $source = in_array($change['field'], ['album', 'releaseDate'], true) && $before['scraped'] !== null
+                    ? 'scraped'
+                    : ($this->valuePresent($before['raw'], $change['field'])
+                        ? 'raw' : ($before['scraped'] !== null ? 'scraped' : 'raw'));
                 $afterValue = $source === 'scraped' ? $before['scraped'] : $before['raw'];
                 $updated = Db::table('media_metadata_field_states')->where('song_id', $songId)
                     ->where('field_key', $change['field'])->where('version', $change['version'])->update([
@@ -324,13 +334,41 @@ final class MediaMetadataService
         return $row;
     }
 
-    private function scopedSongs(array $libraryIds): Builder
+    private function scopedSongs(array $libraryIds, bool $includeUnavailable = false): Builder
     {
-        return Db::table('media_songs as songs')->join('media_albums as albums', 'albums.id', '=', 'songs.album_id')
+        $query = Db::table('media_songs as songs')->join('media_albums as albums', 'albums.id', '=', 'songs.album_id')
             ->join('library_file_inventory as files', 'files.id', '=', 'songs.inventory_file_id')
             ->join('music_libraries as libraries', 'libraries.id', '=', 'songs.library_id')
-            ->whereIn('songs.library_id', $libraryIds ?: [''])->where('files.status', 'available')
+            ->whereIn('songs.library_id', $libraryIds ?: [''])
             ->where('libraries.status', 'active');
+        if (!$includeUnavailable) $query->where('files.status', 'available');
+        return $query;
+    }
+
+    /**
+     * 只按已提交的封面选择与扫描索引事实筛选“缺封面”歌曲。
+     *
+     * 歌曲可使用自己的选择、所属专辑选择、所属专辑本地封面，或同专辑其他歌曲的已选图作为回退；
+     * 四类来源均不存在才视为缺失。查询不打开文件，因此运行时身份损坏仍由图片读取服务失败关闭，
+     * 不会让后台列表触发磁盘 I/O。所有子查询依附已经完成音乐库 manage 裁剪的外层歌曲。
+     */
+    private function applyMissingArtworkFilter(Builder $query): void
+    {
+        $query->whereNotExists(function (Builder $selection): void {
+            $selection->selectRaw('1')->from('media_artwork_selection_overrides as song_artwork')
+                ->whereColumn('song_artwork.song_id', 'songs.id');
+        })->whereNotExists(function (Builder $selection): void {
+            $selection->selectRaw('1')->from('media_artwork_selection_overrides as album_artwork')
+                ->whereColumn('album_artwork.album_id', 'songs.album_id');
+        })->whereNotExists(function (Builder $artwork): void {
+            $artwork->selectRaw('1')->from('media_album_artworks as indexed_artwork')
+                ->whereColumn('indexed_artwork.album_id', 'songs.album_id');
+        })->whereNotExists(function (Builder $fallback): void {
+            $fallback->selectRaw('1')->from('media_songs as album_song')
+                ->join('media_artwork_selection_overrides as fallback_artwork',
+                    'fallback_artwork.song_id', '=', 'album_song.id')
+                ->whereColumn('album_song.album_id', 'songs.album_id');
+        });
     }
 
     /** @return array<string,array{id:string,name:string}> */
@@ -408,7 +446,9 @@ final class MediaMetadataService
     {
         if ($libraryId !== null) $this->requireUlid($libraryId);
         if ($missingField !== null && !in_array($missingField, MetadataFieldSchema::FIELDS, true)) throw new MediaMetadataInvalid('缺失字段筛选无效。');
-        if ($state !== null && !in_array($state, ['scan_error', 'overridden', 'locked', 'recent', 'lyrics_missing'], true)) throw new MediaMetadataInvalid('状态筛选无效。');
+        if ($state !== null && !in_array($state, [
+            'scan_error', 'overridden', 'locked', 'recent', 'lyrics_missing', 'artwork_missing', 'file_missing',
+        ], true)) throw new MediaMetadataInvalid('状态筛选无效。');
         if ($search !== null && (mb_strlen($search, 'UTF-8') < 1 || mb_strlen($search, 'UTF-8') > 100)) throw new MediaMetadataInvalid('搜索词长度无效。');
         if ($limit < 1 || $limit > 100 || $offset < 0 || $offset > 1_000_000) throw new MediaMetadataInvalid('分页参数无效。');
     }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace app\process;
 
+use app\application\Storage\StorageLayout;
+
 use app\application\Scan\ScanAutomationService;
 use app\infrastructure\Scan\LibraryWatchProcess;
 use app\infrastructure\Scan\LibraryWatchUnavailable;
@@ -146,7 +148,7 @@ final class LibraryAutomationWorker
             $this->watcher = new LibraryWatchProcess(
                 $targets,
                 $this->helperPath,
-                '/media',
+                StorageLayout::LIBRARY_ROOT,
                 $this->watchDebounceMs,
             );
             $this->nextRestartAt = 0.0;

@@ -9,6 +9,7 @@ use app\http\RequestContext;
 use app\infrastructure\Airplay\OwnToneClient;
 use app\infrastructure\Airplay\RedisAirplayServiceLease;
 use app\infrastructure\Audit\AuditLogger;
+use support\Log;
 
 /**
  * 编排当前账号到 OwnTone AirPlay 输出的发现、播放和控制。
@@ -79,15 +80,23 @@ final readonly class AirplayService
             $this->gateway->playUrl($ticket['url']);
             return ['succeeded' => true, 'deviceId' => $deviceId, 'songId' => $songId, 'format' => 'raw'];
         } catch (\Throwable $failure) {
-            if (is_string($ticketId)) $this->tickets->revoke($ticketId);
+            if (is_string($ticketId)) {
+                try {
+                    $this->tickets->revoke($ticketId);
+                } catch (\Throwable $compensationFailure) {
+                    $this->logCompensationFailure('AirPlay ticket revocation compensation failed.', $compensationFailure, $requestId);
+                }
+            }
             try {
                 $this->gateway->control($outputId, 'stop');
-            } catch (\Throwable) {
+            } catch (\Throwable $compensationFailure) {
+                $this->logCompensationFailure('AirPlay stop compensation failed.', $compensationFailure, $requestId);
             }
             if ($newLease) {
                 try {
                     $this->lease->release($actor);
-                } catch (\Throwable) {
+                } catch (\Throwable $compensationFailure) {
+                    $this->logCompensationFailure('AirPlay lease release compensation failed.', $compensationFailure, $requestId);
                 }
             }
             throw $failure;
@@ -176,5 +185,20 @@ final readonly class AirplayService
             "velin-airplay-output-audit-v1\0" . $outputId,
             RequestContext::authenticationHashKey(),
         ), 0, 26);
+    }
+
+    /**
+     * 记录投放失败后的尽力补偿异常，同时永远保留触发补偿的原始错误。
+     *
+     * 日志只包含固定消息、异常类与 requestId，不包含账号、输出 ID、媒体 URL、票据或 OwnTone 响应。
+     * logger 自身失败会被丢弃，因为设备副作用已经发生且不能安全重试；票据与租约仍会按有效期自然失效。
+     */
+    private function logCompensationFailure(string $message, \Throwable $failure, string $requestId): void
+    {
+        if (getenv('VELIN_TESTING') === '1') return;
+        try {
+            Log::error($message, ['exception_class' => $failure::class, 'request_id' => $requestId]);
+        } catch (\Throwable) {
+        }
     }
 }

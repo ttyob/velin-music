@@ -7,6 +7,7 @@ namespace app\application\Artwork;
 use app\application\Auth\CapabilityResolver;
 use app\application\Library\LibraryAccessResolver;
 use app\application\Metadata\MetadataWorkerWakeSignal;
+use app\application\Metadata\MetadataScrapePolicyService;
 use app\infrastructure\Metadata\RedisMetadataWorkerWakeSignal;
 use app\infrastructure\Audit\AuditLogger;
 use stdClass;
@@ -39,6 +40,8 @@ final class ArtworkProviderWorkerService
         private readonly AuditLogger $audit = new AuditLogger(),
         private readonly ArtworkCurrentStateService $currentArtwork = new ArtworkCurrentStateService(),
         private readonly MetadataWorkerWakeSignal $metadataWake = new RedisMetadataWorkerWakeSignal(),
+        private readonly MetadataScrapePolicyService $scrapePolicy = new MetadataScrapePolicyService(),
+        private readonly ArtworkBlobStore $blobs = new ArtworkBlobStore(),
     ) {
         $this->gateway = $gateway;
     }
@@ -485,7 +488,9 @@ final class ArtworkProviderWorkerService
             ]);
             if ($changed !== 1) throw new ArtworkProviderRemoteFailure('ARTWORK_PROVIDER_STATE_CONFLICT', false);
             if ((int) ($row->auto_import ?? 0) === 1 && is_string($firstCandidateId)
-                && !$this->currentArtwork->exists($this->type($row), $this->entityId($row), (string) $row->library_id)) {
+                && $this->canAutomaticallySelect(
+                    $this->type($row), $this->entityId($row), (string) $row->library_id,
+                )) {
                 $this->queueAutomaticImport($row, $firstCandidateId, $now);
             }
             $this->audit->record((string) $row->requested_by, 'artwork.provider.search.complete',
@@ -526,12 +531,19 @@ final class ArtworkProviderWorkerService
             $now = gmdate('Y-m-d\TH:i:s\Z');
             if (!$existing instanceof stdClass) {
                 $crop = $this->centerCrop((int) $row->width, (int) $row->height);
+                $candidateBytes = $this->blobs->put(
+                    $normalized,
+                    'image/webp',
+                    ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
+                    ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
+                    $contentSha,
+                );
                 Db::table('media_manual_artwork_candidates')->insert([
                     'id' => $candidateId, 'song_id' => $type === 'song' ? $entityId : null,
                     'album_id' => $type === 'album' ? $entityId : null,
                     'artist_id' => $type === 'artist' ? $entityId : null, 'library_id' => (string) $row->library_id,
                     'created_by' => (string) $row->requested_by, 'mime_type' => 'image/webp',
-                    'image_bytes' => $normalized, 'byte_size' => strlen($normalized),
+                    'image_bytes' => $candidateBytes, 'byte_size' => strlen($normalized),
                     'width' => ArtworkCandidateImageNormalizer::OUTPUT_SIZE,
                     'height' => ArtworkCandidateImageNormalizer::OUTPUT_SIZE, 'content_sha256' => $contentSha,
                     'crop_x' => $crop['x'], 'crop_y' => $crop['y'], 'crop_width' => $crop['width'],
@@ -543,15 +555,27 @@ final class ArtworkProviderWorkerService
                 ]);
             }
             if ((int) ($row->auto_select ?? 0) === 1
-                && !$this->currentArtwork->exists($type, $entityId, (string) $row->library_id)) {
-                Db::table('media_artwork_selection_overrides')->insert([
+                && $this->canAutomaticallySelect($type, $entityId, (string) $row->library_id)) {
+                /** @var stdClass|null $selection */
+                $selection = Db::table('media_artwork_selection_overrides')->where($type . '_id', $entityId)
+                    ->where('library_id', (string) $row->library_id)->first(['id', 'candidate_id']);
+                $selectionValues = [
+                    'candidate_id' => $candidateId, 'updated_by' => (string) $row->requested_by,
+                    'updated_at' => $now,
+                ];
+                if ($selection instanceof stdClass) {
+                    if (!hash_equals((string) $selection->candidate_id, $candidateId)) {
+                        Db::table('media_artwork_selection_overrides')->where('id', (string) $selection->id)
+                            ->update($selectionValues + ['version' => Db::raw('version + 1')]);
+                    }
+                } else {
+                    Db::table('media_artwork_selection_overrides')->insert([
                     'id' => (string) new Ulid(), 'song_id' => $type === 'song' ? $entityId : null,
                     'album_id' => $type === 'album' ? $entityId : null,
                     'artist_id' => $type === 'artist' ? $entityId : null,
-                    'library_id' => (string) $row->library_id, 'candidate_id' => $candidateId,
-                    'version' => 1, 'updated_by' => (string) $row->requested_by,
-                    'created_at' => $now, 'updated_at' => $now,
-                ]);
+                    'library_id' => (string) $row->library_id, 'version' => 1, 'created_at' => $now,
+                    ] + $selectionValues);
+                }
                 $this->audit->record((string) $row->requested_by, 'artwork.provider.backfill.select',
                     $type, $entityId, 'success', (string) $row->request_id, [
                         'candidateId' => $candidateId, 'libraryId' => (string) $row->library_id,
@@ -571,6 +595,28 @@ final class ArtworkProviderWorkerService
                     'importedCandidateId' => $candidateId, 'providerKey' => (string) $row->provider_key,
                 ]);
         });
+    }
+
+    /**
+     * 判断自动 Provider 导入是否可成为实体当前封面。
+     *
+     * 显式手工候选永远保持最高优先级。歌曲与专辑没有显式选择但存在扫描图时，仅相应三方优先配置
+     * 允许创建覆盖；已有 Provider 选择也只在三方优先时更新。艺人图未开放此配置，继续只补空缺。
+     */
+    private function canAutomaticallySelect(string $type, string $entityId, string $libraryId): bool
+    {
+        /** @var stdClass|null $selection */
+        $selection = Db::table('media_artwork_selection_overrides')->where($type . '_id', $entityId)
+            ->where('library_id', $libraryId)->first(['candidate_id']);
+        $field = $type === 'song' ? 'songArtwork' : ($type === 'album' ? 'albumArtwork' : null);
+        if ($selection instanceof stdClass) {
+            $origin = Db::table('media_manual_artwork_candidates')->where('id', (string) $selection->candidate_id)
+                ->value('origin_kind');
+            return $field !== null && $origin === 'provider'
+                && $this->scrapePolicy->providerOverridesMetadata($field);
+        }
+        if (!$this->currentArtwork->exists($type, $entityId, $libraryId)) return true;
+        return $field !== null && $this->scrapePolicy->providerOverridesMetadata($field);
     }
 
     /**

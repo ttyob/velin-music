@@ -1,0 +1,4 @@
+# Docker SQLite、WAL、备份和恢复现场都属于部署数据；目录本身纳入 Git，保证 Compose 的
+# create_host_path:false 在全新检出中仍有明确挂载源，但其中任何业务数据都不得提交。
+*
+!.gitignore

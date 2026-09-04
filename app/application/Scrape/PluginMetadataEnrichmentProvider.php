@@ -24,7 +24,10 @@ final readonly class PluginMetadataEnrichmentProvider implements MetadataEnrichm
 {
     private const PLUGIN_KEY = 'metadata-scrape';
 
-    public function __construct(private ExternalMetadataScrapePluginRegistry $plugins = new PhpResourcePluginRegistry())
+    public function __construct(
+        private ExternalMetadataScrapePluginRegistry $plugins = new PhpResourcePluginRegistry(),
+        private ChineseQueryVariantNormalizer $identityNormalizer = new ChineseQueryVariantNormalizer(),
+    )
     {
     }
 
@@ -92,6 +95,7 @@ final readonly class PluginMetadataEnrichmentProvider implements MetadataEnrichm
                 is_string($context['parentDirectory'] ?? null) ? $context['parentDirectory'] : null,
                 is_string($context['grandparentDirectory'] ?? null) ? $context['grandparentDirectory'] : null,
                 $taskIdentity,
+                is_int($metadata['durationMs'] ?? null) && $metadata['durationMs'] > 0 ? $metadata['durationMs'] : null,
             );
         }
         return MetadataScrapeCompletionRequest::fromMetadata(
@@ -101,6 +105,7 @@ final readonly class PluginMetadataEnrichmentProvider implements MetadataEnrichm
             is_array($metadata['albumArtists'] ?? null) && $metadata['albumArtists'] !== []
                 ? array_values($metadata['albumArtists']) : null,
             $taskIdentity,
+            is_int($metadata['durationMs'] ?? null) && $metadata['durationMs'] > 0 ? $metadata['durationMs'] : null,
         );
     }
 
@@ -170,7 +175,9 @@ final readonly class PluginMetadataEnrichmentProvider implements MetadataEnrichm
      *
      * 插件负责实际文件名解析和第三方候选排序，但自动审批不能只信任一个恰好达到阈值的分数。当路径同时
      * 提供 `艺人/专辑/文件` 三层事实时，最终标题、完整艺人集合和专辑必须与这些冻结片段严格一致；
-     * metadata 模式则以扫描阶段冻结的标题、完整艺人集合、可选专辑和可选专辑艺人为准。这样远程发布
+     * metadata 模式只以扫描阶段冻结的标题和完整歌曲艺人集合复验作品身份。专辑名与专辑艺人属于发行
+     * 上下文，同一录音可以同时存在于原始专辑和精选集，插件已用它们参与评分但核心不得要求最终发行字段
+     * 与文件标签完全相同。这样既允许 `48首選` 中的歌曲补充 `The Easy Ride` 发行信息，也让远程发布
      * 快照从 filename_only 升级为可信 raw 后，`Sazablue, 周深.` 之类仅部分包含已知艺人的结果仍会收口
      * 为 unmatched。文件名两层以下没有完整目录证据时不在核心猜测语义。比较只折叠大小写、全半角和
      * 空白，不删除标点或别名，避免把不同艺人再次合并。本方法只检查内存 DTO，不记录第三方字段或修改任务。
@@ -182,30 +189,20 @@ final readonly class PluginMetadataEnrichmentProvider implements MetadataEnrichm
         $metadata = $local->metadata;
         if ($result->status !== MetadataScrapeCompletionResult::MATCHED
             || !is_array($result->metadata)) return true;
+        // 只对本次身份复验所需的内存副本执行 OpenCC；扫描原文和插件显示文本均不改写。
+        [$metadata, $resultMetadata] = $this->identityNormalizer->simplify([$metadata, $result->metadata]);
         if (($metadata['scrapeInputMode'] ?? null) !== MetadataScrapeCompletionRequest::MODE_FILENAME) {
             $expectedTitle = is_string($metadata['title'] ?? null) ? $metadata['title'] : '';
             $expectedArtists = is_array($metadata['artists'] ?? null)
                 ? array_values(array_filter($metadata['artists'], 'is_string')) : [];
-            $actualTitle = is_string($result->metadata['title'] ?? null) ? $result->metadata['title'] : '';
-            $actualArtists = is_array($result->metadata['artists'] ?? null)
-                ? array_values(array_filter($result->metadata['artists'], 'is_string')) : [];
+            $actualTitle = is_string($resultMetadata['title'] ?? null) ? $resultMetadata['title'] : '';
+            $actualArtists = is_array($resultMetadata['artists'] ?? null)
+                ? array_values(array_filter($resultMetadata['artists'], 'is_string')) : [];
             if ($expectedTitle !== '' && $this->identityText($actualTitle) !== $this->identityText($expectedTitle)) {
                 return false;
             }
             if ($expectedArtists !== [] && $this->identitySet($actualArtists) !== $this->identitySet($expectedArtists)) {
                 return false;
-            }
-            $expectedAlbum = is_string($metadata['albumTitle'] ?? null) ? trim($metadata['albumTitle']) : '';
-            if ($expectedAlbum !== '') {
-                $actualAlbum = is_string($result->metadata['albumTitle'] ?? null)
-                    ? $result->metadata['albumTitle'] : '';
-                if ($this->identityText($actualAlbum) !== $this->identityText($expectedAlbum)) return false;
-            }
-            $expectedAlbumArtists = is_array($metadata['albumArtists'] ?? null)
-                ? array_values(array_filter($metadata['albumArtists'], 'is_string')) : [];
-            if ($expectedAlbumArtists !== [] && is_array($result->metadata['albumArtists'] ?? null)) {
-                $actualAlbumArtists = array_values(array_filter($result->metadata['albumArtists'], 'is_string'));
-                if ($this->identitySet($actualAlbumArtists) !== $this->identitySet($expectedAlbumArtists)) return false;
             }
             return true;
         }
@@ -217,10 +214,10 @@ final readonly class PluginMetadataEnrichmentProvider implements MetadataEnrichm
         $artist = is_string($context['grandparentDirectory'] ?? null) ? trim($context['grandparentDirectory']) : '';
         if ($file === '' || $album === '' || $artist === '') return true;
         $file = trim((string) preg_replace('/^\s*(?:\d{1,4}[ ._-]+|[A-Z]?\d{1,3}[ ._-]+)(?=\S)/iu', '', $file));
-        $title = is_string($result->metadata['title'] ?? null) ? $result->metadata['title'] : '';
-        $resultAlbum = is_string($result->metadata['albumTitle'] ?? null) ? $result->metadata['albumTitle'] : '';
-        $resultArtists = is_array($result->metadata['artists'] ?? null)
-            ? array_values(array_filter($result->metadata['artists'], 'is_string')) : [];
+        $title = is_string($resultMetadata['title'] ?? null) ? $resultMetadata['title'] : '';
+        $resultAlbum = is_string($resultMetadata['albumTitle'] ?? null) ? $resultMetadata['albumTitle'] : '';
+        $resultArtists = is_array($resultMetadata['artists'] ?? null)
+            ? array_values(array_filter($resultMetadata['artists'], 'is_string')) : [];
         $expectedArtists = preg_split('/\s*(?:、|,|，|;|；|&)\s*/u', $artist) ?: [];
         return $this->identityText($title) === $this->identityText($file)
             && $this->identityText($resultAlbum) === $this->identityText($album)

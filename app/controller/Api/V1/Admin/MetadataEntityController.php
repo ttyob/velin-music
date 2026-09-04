@@ -11,6 +11,7 @@ use app\application\Metadata\MetadataEntityConflict;
 use app\application\Metadata\MetadataEntityInvalid;
 use app\application\Metadata\MetadataEntityNotFound;
 use app\application\Metadata\MetadataEntityService;
+use app\application\Metadata\MetadataEntityDeletionService;
 use app\http\JsonResponseFactory;
 use app\http\RequestContext;
 use support\Log;
@@ -62,6 +63,27 @@ final class MetadataEntityController
                 $actor, $type, $entityId,
                 $this->integer($request->get('limit'), 500), $this->integer($request->get('offset'), 0),
             );
+        });
+    }
+
+    /**
+     * 删除专辑或艺人及其歌曲索引和刮削派生数据。
+     *
+     * 该危险入口使用独立的 `manage_library` 能力，而不是仅凭 `edit_metadata` 放行；请求体只接受按
+     * 类型固定的确认词，领域服务负责全部库范围、文件回收站、并发任务和外键清理。Controller 不执行
+     * 数据库级联或文件操作，响应仅返回删除统计，不暴露媒体路径和歌词内容。
+     */
+    public function deleteEntity(Request $request, string $type, string $entityId): Response
+    {
+        return $this->executeDelete($request, function (array $actor, string $requestId) use ($request, $type, $entityId): array {
+            $payload = $this->payload($request, ['confirmation']);
+            return ['deletion' => (new MetadataEntityDeletionService())->delete(
+                $actor,
+                $type,
+                $entityId,
+                $this->string($payload['confirmation']),
+                $requestId,
+            )];
         });
     }
 
@@ -169,6 +191,34 @@ final class MetadataEntityController
                 'request_id' => $requestId, 'exception_class' => $throwable::class,
             ]);
             return JsonResponseFactory::error('METADATA_ENTITY_UNAVAILABLE', '元数据关系服务暂时不可用。', 503, $requestId);
+        }
+    }
+
+    /** 删除命令的授权和异常映射；与普通元数据编辑分离，避免误放大权限。 */
+    private function executeDelete(Request $request, callable $operation): Response
+    {
+        $requestId = RequestContext::requestId();
+        try {
+            $actor = (new AuthorizationService())->requireCapability($request, 'manage_library');
+            $data = $operation($actor, $requestId);
+            return JsonResponseFactory::create(['data' => $data, 'meta' => [
+                'requestId' => $requestId, 'timestamp' => gmdate('c'),
+            ]], 200, $requestId);
+        } catch (AuthenticationRequired) {
+            return JsonResponseFactory::error('AUTHENTICATION_REQUIRED', '请先登录。', 401, $requestId);
+        } catch (AuthorizationDenied) {
+            return JsonResponseFactory::error('PERMISSION_DENIED', '没有管理音乐库的权限。', 403, $requestId);
+        } catch (MetadataEntityInvalid) {
+            return JsonResponseFactory::error('METADATA_ENTITY_INVALID', '请检查实体和删除确认信息。', 422, $requestId);
+        } catch (MetadataEntityNotFound) {
+            return JsonResponseFactory::error('METADATA_ENTITY_NOT_FOUND', '实体不存在或不可管理。', 404, $requestId);
+        } catch (MetadataEntityConflict $throwable) {
+            return JsonResponseFactory::error('METADATA_ENTITY_CONFLICT', $throwable->getMessage(), 409, $requestId);
+        } catch (Throwable $throwable) {
+            Log::error('Metadata entity deletion failed.', [
+                'request_id' => $requestId, 'exception_class' => $throwable::class,
+            ]);
+            return JsonResponseFactory::error('METADATA_ENTITY_UNAVAILABLE', '实体删除服务暂时不可用。', 503, $requestId);
         }
     }
 

@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace app\application\Artist;
 
-use app\application\Search\SearchTextNormalizer;
+use app\application\Storage\StorageLayout;
 use PDO;
 use Throwable;
 
@@ -22,8 +22,8 @@ final class ArtistDatabaseProfileIdentityResolver implements ArtistProfileIdenti
     private bool $unavailable = false;
 
     public function __construct(
-        private readonly string $databasePath = '/media/cache/artist-database/musicbrainz_artists_zh.sqlite',
-        private readonly SearchTextNormalizer $normalizer = new SearchTextNormalizer(),
+        private readonly string $databasePath = StorageLayout::ARTIST_DATABASE_PATH,
+        private readonly ArtistNameIdentityNormalizer $normalizer = new ArtistNameIdentityNormalizer(),
     ) {
     }
 
@@ -31,7 +31,7 @@ final class ArtistDatabaseProfileIdentityResolver implements ArtistProfileIdenti
     public function resolve(string $artistName): ?ArtistProfileIdentity
     {
         $artistName = trim($artistName);
-        $needle = $this->normalizer->normalize($artistName);
+        $needle = $this->normalizer->identityKey($artistName);
         if ($needle === '' || mb_strlen($artistName, 'UTF-8') > 160 || $this->unavailable) return null;
         try {
             $pdo = $this->connection();
@@ -55,7 +55,7 @@ SQL);
             while (($row = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
                 foreach (['name_zh', 'name_original', 'alias_zh', 'alias_original'] as $field) {
                     if (is_string($row[$field] ?? null)
-                        && $this->normalizer->normalize($row[$field]) === $needle) {
+                        && $this->normalizer->identityKey($row[$field]) === $needle) {
                         $mbid = strtolower(trim((string) ($row['mbid'] ?? '')));
                         if ($this->validMbid($mbid)) $matches[$mbid] = $row;
                         break;

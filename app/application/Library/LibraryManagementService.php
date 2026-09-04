@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace app\application\Library;
 
+use app\application\Storage\StorageLayout;
+
 use app\application\System\NetworkProxyProfileService;
 use app\infrastructure\Audit\AuditLogger;
 use app\application\Notification\NotificationPublisher;
@@ -99,7 +101,7 @@ final class LibraryManagementService
      * 登记一个不重叠的媒体库根，并授予创建者管理范围。
      *
      * 媒体根在事务前和即将插入时各解析一次，第二次可发现等待 SQLite 期间发生的挂载或软链接替换。
-     * `managed_cache` 只要求库可读，`adjacent` 要求库可写；两者都必须位于 `/media`，且不能与固定缓存、
+     * `managed_cache` 只要求库可读，`adjacent` 要求库可写；两者都必须位于 `/storage/music`，且不能与固定缓存、
      * 现有库根或升级期旧 inbox/watch 路径重叠。方法不读取媒体内容，失败回滚数据库且无文件副作用。
      *
      * @param array<string, mixed> $actor Authorized manage_library principal.
@@ -745,7 +747,7 @@ final class LibraryManagementService
     /** 固定缓存根不能等于或包含媒体库；缺失缓存由部署/启动预检报告，而不是 HTTP 请求创建。 */
     private function assertCacheSeparated(string $resolvedRoot): void
     {
-        $configured = (string) (getenv('VELIN_SCRAPE_CACHE_PATH') ?: '/media/cache/scrape');
+        $configured = StorageLayout::SCRAPE_CACHE_ROOT;
         $cache = realpath($configured);
         if ($cache !== false && $this->paths->overlaps($resolvedRoot, $cache)) {
             throw new LibraryConflict('音乐库目录不能与刮削缓存目录相同或互相包含。');
@@ -872,8 +874,9 @@ final class LibraryManagementService
      *
      * OAuth/Graph 验证和 refresh token 解密都在 SQLite 事务外完成；失败时旧连接完全保留。已有库存后，
      * 租户、应用 ID、授权账号、stable drive ID 或盘内根均不能原地改变，因为它们共同决定远端对象身份。
-     * 已授权连接可省略授权 ID 继续使用现有 grant；重新授权会在成功事务内原子消费会话并替换密文。
-     * 成功不修改远端文件，也不自动触发扫描。
+     * 已授权连接可省略授权 ID 继续使用现有 grant；代理只是网络出口变化，不要求重新 OAuth。代理变更仍
+     * 会在提交前使用新代理做真实连接预检；重新授权会在成功事务内原子消费会话并替换密文。成功不修改
+     * 远端文件，也不自动触发扫描。
      *
      * @param array<string,mixed> $current
      * @param array<string,mixed> $actor
@@ -911,10 +914,6 @@ final class LibraryManagementService
             $accountId = $grant->accountId;
             $driveId = $grant->driveId;
             $replacementCiphertext = $grant->refreshTokenCiphertext;
-        } elseif (($current['proxyProfileId'] ?? null) !== $input->proxyProfileId) {
-            throw new LibraryValidationFailed([
-                'oneDriveAuthorizationId' => ['切换 OneDrive 代理后必须重新完成 Microsoft 授权。'],
-            ]);
         } elseif ((string) $connection->authorization_status !== 'authorized') {
             throw new LibraryValidationFailed([
                 'oneDriveAuthorizationId' => ['该旧 OneDrive 连接需要重新完成 Microsoft 授权。'],
@@ -934,14 +933,14 @@ final class LibraryManagementService
             if ($grant instanceof OneDriveAuthorizationGrant) sodium_memzero($grant->refreshToken);
             throw new LibraryConflict('OneDrive 音乐库已有媒体，不能直接修改租户、应用、授权账号、drive 或盘内根。');
         }
+        $proxy = $input->proxyProfileId === null ? null
+            : (new NetworkProxyProfileService())->connection($input->proxyProfileId);
         $this->assertOneDriveAvailable(
             $driveId,
             (string) $input->rootPath,
             $libraryId,
         );
         if ($grant instanceof OneDriveAuthorizationGrant) {
-            $proxy = $input->proxyProfileId === null ? null
-                : (new NetworkProxyProfileService())->connection($input->proxyProfileId);
             try {
                 $this->oneDriveClients->forConfiguration(
                     $grant->tenantId,
@@ -955,7 +954,7 @@ final class LibraryManagementService
                 sodium_memzero($grant->refreshToken);
             }
         } else {
-            $this->oneDriveClients->forLibrary($libraryId)->assertConnection();
+            $this->oneDriveClients->forLibraryUsingProxy($libraryId, $proxy)->assertConnection();
         }
         $now = gmdate('Y-m-d\TH:i:s\Z');
         Db::transaction(function () use (
@@ -1021,9 +1020,10 @@ final class LibraryManagementService
      * 更新 Google Drive 连接，并以库版本 CAS 原子消费可选的新 OAuth 读写 grant。
      *
      * OAuth/Drive 验证在 SQLite 事务外完成。未提交授权 ID时只能保留完全相同的 client、账号、drive 与
-     * 根；修改 drive 或根也要求重新授权，以便使用新 grant 对新对象树做真实预检。已有库存后任何远端
-     * 身份变化均拒绝，防止相同相对路径被重新解释。事务只保存密文、通用库策略和脱敏审计，不访问
-     * Google、不触发扫描，也不修改远端文件；CAS 或消费失败会回滚旧连接。
+     * 根；修改 drive 或根也要求重新授权，以便使用新 grant 对新对象树做真实预检。代理只是网络出口变化，
+     * 不要求重新 OAuth；代理变更会在提交前使用新代理做真实连接预检。已有库存后任何远端身份变化均拒绝，
+     * 防止相同相对路径被重新解释。事务只保存密文、通用库策略和脱敏审计，不访问 Google、不触发扫描，
+     * 也不修改远端文件；CAS 或消费失败会回滚旧连接。
      *
      * @param array<string,mixed> $current
      * @param array<string,mixed> $actor
@@ -1061,10 +1061,6 @@ final class LibraryManagementService
             }
             $clientId = $grant->clientId;
             $accountId = $grant->accountId;
-        } elseif (($current['proxyProfileId'] ?? null) !== $input->proxyProfileId) {
-            throw new LibraryValidationFailed([
-                'googleDriveAuthorizationId' => ['切换 Google Drive 代理后必须重新完成 Google 授权。'],
-            ]);
         } elseif ((string) $connection->authorization_status !== 'authorized') {
             throw new LibraryValidationFailed([
                 'googleDriveAuthorizationId' => ['该 Google Drive 连接需要重新授权。'],
@@ -1086,10 +1082,10 @@ final class LibraryManagementService
             }
             throw new LibraryConflict('Google Drive 音乐库已有媒体，不能直接修改账号、盘或根路径。');
         }
+        $proxy = $input->proxyProfileId === null ? null
+            : (new NetworkProxyProfileService())->connection($input->proxyProfileId);
         $this->assertGoogleDriveAvailable($accountId, $input->googleDriveId, (string) $input->rootPath, $libraryId);
         if ($grant instanceof GoogleDriveAuthorizationGrant) {
-            $proxy = $input->proxyProfileId === null ? null
-                : (new NetworkProxyProfileService())->connection($input->proxyProfileId);
             try {
                 $this->googleDriveClients->forConfiguration(
                     $grant->clientId,
@@ -1104,7 +1100,7 @@ final class LibraryManagementService
                 sodium_memzero($grant->refreshToken);
             }
         } else {
-            $this->googleDriveClients->forLibrary($libraryId)->assertConnection();
+            $this->googleDriveClients->forLibraryUsingProxy($libraryId, $proxy)->assertConnection();
         }
         $now = gmdate('Y-m-d\TH:i:s\Z');
         Db::transaction(function () use (
@@ -1229,7 +1225,7 @@ final class LibraryManagementService
     {
         $sourceType = (string) ($row->source_type ?? 'local');
         $isDefault = (string) $row->id === self::DEFAULT_LIBRARY_ID
-            || (string) $row->root_path === '/media/library';
+            || (string) $row->root_path === StorageLayout::LIBRARY_ROOT;
         return [
             'id' => (string) $row->id,
             'name' => (string) $row->name,

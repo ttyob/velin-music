@@ -47,14 +47,22 @@ final class FfmpegTranscodeRunner
     private mixed $previousOnClose = null;
     private mixed $previousOnBufferFull = null;
     private mixed $previousOnBufferDrain = null;
+    private string $runtimeRoot;
 
     public function __construct(
         private readonly TcpConnection $connection,
         private readonly TranscodePlan $plan,
         private readonly StorageWriteGuard $storageGuard = new StorageWriteGuard(),
         private readonly ?string $deliveryTicketId = null,
+        ?string $runtimeRoot = null,
     ) {
         $this->events = Worker::getEventLoop();
+        $runtime = $runtimeRoot ?? (string) (getenv('VELIN_RUNTIME_PATH') ?: base_path('runtime'));
+        // Docker 固定使用 `/app/runtime -> /data/runtime`。先把已存在的运行根规范化，保证临时文件创建时
+        // 的目录字符串与发布阶段 realpath 使用同一身份；不存在或无法解析时保留原值，由 open/cache
+        // 边界失败关闭。这里只解析部署配置，不接受请求路径，也不会创建或跟随子目录链接。
+        $resolvedRuntime = realpath($runtime);
+        $this->runtimeRoot = rtrim(is_string($resolvedRuntime) ? $resolvedRuntime : $runtime, DIRECTORY_SEPARATOR);
     }
 
     /**
@@ -121,9 +129,8 @@ final class FfmpegTranscodeRunner
      */
     private function openSpool(): void
     {
-        $runtime = (string) (getenv('VELIN_RUNTIME_PATH') ?: base_path('runtime'));
         $cacheKey = $this->validCacheKey();
-        $directory = rtrim($runtime, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR
+        $directory = $this->runtimeRoot . DIRECTORY_SEPARATOR
             . ($cacheKey === null ? 'transcode-spool' : 'dlna-transcode-cache');
         // 精确长度模式会先落完整临时文件，必须在 mkdir/fopen 前验证预计扩张与挂载身份。
         $this->storageGuard->assertTranscodeCacheAllowed($directory, $this->plan->maxOutputBytes);
@@ -383,8 +390,7 @@ final class FfmpegTranscodeRunner
     /** 解析兼容既有部署目录名的固定接收器缓存根；读取不创建，写入只创建应用拥有的一级子目录。 */
     private function cacheDirectory(bool $create): ?string
     {
-        $runtime = rtrim((string) (getenv('VELIN_RUNTIME_PATH') ?: base_path('runtime')), DIRECTORY_SEPARATOR);
-        $directory = $runtime . DIRECTORY_SEPARATOR . 'dlna-transcode-cache';
+        $directory = $this->runtimeRoot . DIRECTORY_SEPARATOR . 'dlna-transcode-cache';
         if ($create && !is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) return null;
         if (!is_dir($directory) || is_link($directory) || !is_writable($directory)) return null;
         $resolved = realpath($directory);

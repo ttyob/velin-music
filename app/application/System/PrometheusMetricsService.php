@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace app\application\System;
 
+use app\application\Storage\StorageLayout;
+
 use app\infrastructure\Observability\HttpMetricStore;
 use stdClass;
 use support\Db;
@@ -84,6 +86,16 @@ final readonly class PrometheusMetricsService
             $lines[] = 'velin_storage_bytes{scope="' . $scope . '",kind="available"} ' . $capacity['available'];
             $lines[] = 'velin_storage_bytes{scope="' . $scope . '",kind="total"} ' . $capacity['total'];
         }
+        $backup = $this->latestBackup();
+        $lines[] = '# HELP velin_sqlite_backup_last_success_timestamp_seconds 最近一份已验证自动备份的完成时间。';
+        $lines[] = '# TYPE velin_sqlite_backup_last_success_timestamp_seconds gauge';
+        $lines[] = 'velin_sqlite_backup_last_success_timestamp_seconds ' . $backup['timestamp'];
+        $lines[] = '# HELP velin_sqlite_backup_last_size_bytes 最近一份已验证自动备份的字节数。';
+        $lines[] = '# TYPE velin_sqlite_backup_last_size_bytes gauge';
+        $lines[] = 'velin_sqlite_backup_last_size_bytes ' . $backup['bytes'];
+        $lines[] = '# HELP velin_sqlite_backups 当前自动备份保留数量。';
+        $lines[] = '# TYPE velin_sqlite_backups gauge';
+        $lines[] = 'velin_sqlite_backups ' . $backup['count'];
         $lines[] = '# HELP velin_transcode_slots FFmpeg 全局转码槽的当前占用与配置上限。';
         $lines[] = '# TYPE velin_transcode_slots gauge';
         $transcode = $this->transcodeSlots();
@@ -148,7 +160,7 @@ final readonly class PrometheusMetricsService
     private function storage(): array
     {
         $database = dirname((string) (getenv('VELIN_DB_PATH') ?: base_path('database/velin.sqlite')));
-        $media = (string) (getenv('VELIN_MEDIA_ROOT') ?: '/media');
+        $media = StorageLayout::STORAGE_ROOT;
         $result = [];
         foreach (['database' => $database, 'media' => $media] as $scope => $path) {
             $available = is_dir($path) && !is_link($path) ? @disk_free_space($path) : false;
@@ -184,6 +196,36 @@ final readonly class PrometheusMetricsService
             fclose($handle);
         }
         return ['active' => $active, 'limit' => $limit];
+    }
+
+    /**
+     * 只统计固定自动备份目录内符合命名契约的非链接文件。
+     *
+     * 文件名时间由备份服务在完整性检查后生成并原子发布，因此可作为最近成功时间；不存在或目录身份
+     * 异常时返回零，让告警明确触发，绝不把当前抓取时间伪装为成功备份。
+     *
+     * @return array{timestamp:int,bytes:int,count:int}
+     */
+    private function latestBackup(): array
+    {
+        $database = (string) (getenv('VELIN_DB_PATH') ?: base_path('database/velin.sqlite'));
+        $resolvedDatabase = realpath($database);
+        if (is_string($resolvedDatabase)) $database = $resolvedDatabase;
+        $root = dirname($database) . '/backups/automatic';
+        if (!is_dir($root) || is_link($root) || realpath($root) !== $root) {
+            return ['timestamp' => 0, 'bytes' => 0, 'count' => 0];
+        }
+        $backups = [];
+        foreach (glob($root . '/*.sqlite') ?: [] as $path) {
+            if (is_link($path) || !is_file($path)
+                || preg_match('/\/(\d{8})T(\d{6})Z-[a-f0-9]{12}\.sqlite$/D', $path, $matches) !== 1) continue;
+            $timestamp = strtotime($matches[1] . 'T' . $matches[2] . 'Z');
+            $size = filesize($path);
+            if ($timestamp !== false && $size !== false && $size > 0) $backups[] = [$timestamp, $size];
+        }
+        if ($backups === []) return ['timestamp' => 0, 'bytes' => 0, 'count' => 0];
+        usort($backups, static fn (array $left, array $right): int => $right[0] <=> $left[0]);
+        return ['timestamp' => $backups[0][0], 'bytes' => $backups[0][1], 'count' => count($backups)];
     }
 
     /** 把微秒整数稳定格式化为不使用科学计数法的秒值。 */

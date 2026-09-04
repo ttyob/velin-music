@@ -250,7 +250,13 @@ final class PlaylistController
         }
     }
 
-    /** Exports one currently readable list without paths, embedded credentials, or state changes. */
+    /**
+     * 导出当前账号实时可读的路径无关 M3U8 附件。
+     *
+     * 前置条件是认证主体具备 play，领域服务还会重新裁剪歌单及歌曲的当前授权。正文只含稳定流地址，
+     * 不含物理路径、来源文件名或认证参数；下载名由服务端生成并同时提供 ASCII 回退。该读取不创建导出
+     * 任务、不修改歌单或播放统计，失败经统一映射且日志不记录正文或文件名。
+     */
     public function export(Request $request, string $playlistId): Response
     {
         $requestId = RequestContext::requestId();
