@@ -1,4 +1,4 @@
-# Velin Music 0.1.25
+# Velin Music 0.1.26
 
 <p align="center">
   <strong>自托管音乐库、播放器与媒体服务</strong><br>
@@ -17,8 +17,9 @@ Velin Music 是面向个人、家庭和小型团队的自托管音乐服务。�
 Web 播放器、歌词与封面、收藏和播放列表，并通过管理后台完成曲库扫描、任务、插件和系统设置。
 原始音频不会因为刮削或整理而被移动或改名。
 
-公开仓库是由私有源码仓库导出的可运行 backend 构建版本，包含 PHP 应用、数据库迁移、前端静态文件、
-已在 Alpine 中验证的 `linux/amd64` Helper 和公开插件归档；不包含私有源码、用户数据、媒体文件或凭据。
+公开仓库是由私有源码仓库导出的可运行 backend 构建版本，包含 PHP 应用、数据库迁移、前端静态文件和
+已在 Alpine 中验证的 `linux/amd64` Helper；不包含私有源码、用户数据、媒体文件或凭据。公开插件包单独
+发布到 [Velin Music 插件库](https://github.com/ttyob/velin-music-plugins)，不附在 backend Release 中。
 
 ## 功能
 
@@ -72,7 +73,7 @@ Go 网关只负责高并发的静态和媒体读取；Webman 负责认证、授�
 当作生产 Compose 的构建上下文。
 
 ```bash
-VERSION=0.1.25
+VERSION=0.1.26
 curl -fL -o "velin-music-deploy-${VERSION}.tar.gz" \
   "https://github.com/ttyob/velin-music/releases/download/v${VERSION}/velin-music-deploy-${VERSION}.tar.gz"
 tar -xzf "velin-music-deploy-${VERSION}.tar.gz"
@@ -138,8 +139,10 @@ docker compose stop
 
 - `velin-music-deploy-X.Y.Z.tar.gz`：只含运行配置的 Docker Compose 部署包
 - `SHA256SUMS` 与部署包内的 `CONTENTS.sha256`：文件完整性校验
-- `metadata-scrape-*.zip`、`lx-music-*.zip`、`jackett-*.zip`：公开插件归档
 - GHCR 中的 `linux/amd64` 镜像、SBOM、构建证明和签名
+
+公开插件归档和 `index.json` 位于独立的 [Velin Music 插件库](https://github.com/ttyob/velin-music-plugins)，
+backend Release 不重复附带插件 ZIP。
 
 镜像标签用于阅读和发现版本，生产环境应优先使用部署包写入的 digest。发布流程不会覆盖已经存在的版本标签。
 

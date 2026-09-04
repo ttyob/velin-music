@@ -70,9 +70,9 @@ RUN set -eux; \
 FROM alpine:3.22 AS initial-plugin-build
 WORKDIR /initial-plugins
 COPY --from=source-verifier /source/release-assets/plugins /plugins
-COPY --from=source-verifier /source/initial-plugins/manifest.json /manifest.json
+COPY --from=source-verifier /source/initial-plugins/manifest.json /out/manifest.json
 RUN set -eux; \
-    archive="$(sed -n 's/^[[:space:]]*"archive"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' /manifest.json)"; \
+    archive="$(sed -n 's/^[[:space:]]*"archive"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' /out/manifest.json)"; \
     printf '%s\n' "$archive" | grep -Eq '^metadata-scrape-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.zip$'; \
     test -f "/plugins/$archive"; \
     mkdir -p /out; \
