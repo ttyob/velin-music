@@ -1,7 +1,7 @@
 ca470c0ab423781008066c2430ef668663aa57e2f37661b051b7ae4c7088bc28  ./.env.docker.example
 3ff1924e4a3689aa6556991589d56875882cecf42ba5af6c0be2aafeb05eb2ed  ./.github/workflows/publish-image.yml
-55138fe54ec336a66507586fb060d145312bc4eb9ec8ac960db80af702bd56b3  ./Dockerfile
-78b980ca7cbf171ef3a18073812fc39ae93e7a6085ac58617d8581a748d19d58  ./README.md
+1382244bbe6282c8e4af307cb2ab0a781d8e74f0cd4e216cb5863bcd6c40543b  ./Dockerfile
+1771cc5a81b9a77d857db5edbec977022fe20b9a3a4bc9507225ea5d3c298418  ./README.md
 a9984a5079e825a1cad672092474763d2602226b3302914091860117d9c3fc10  ./app/application/Account/AccountAvatarImage.php
 77e39b61ff887329c4565a795ce5b80312d900f8052dcd086eaabda92388ecc3  ./app/application/Account/AccountAvatarService.php
 85cc5018f3e196ed5a0ff14d51ba7404a54461ce7b691cb64051cfb859a77b33  ./app/application/Account/EmergencyPasswordResetInvalid.php
@@ -736,9 +736,9 @@ cb847fa9de0c5dc2a7c9103becbd3cceb59f6b3381dbd82869c6521ef4d46883  ./app/process/
 266483dd929a1c86038f417faeba8cf6a7b67c210e802ae89aeb3217f90d3a2b  ./app/process/RuntimeMaintenanceWorker.php
 27a614801b1af31fa145ab00fcf5f2ff77d2fde788d5fdd22eec95246457f128  ./app/process/ScrobbleDeliveryWorker.php
 9bf08486c83a9709b3581f348daf3148e88128570e65c8c6f109ad7859fa4ab0  ./app/process/UploadWorker.php
-f3f54d165a42fb68ff077234f17b228767d18251da5aeb6b0ce126a6656fa754  ./artifacts/bin/linux-amd64/velin-dlna-helper
-4d82c9d4178c7a47cd74840aa0d21800aa2e9f2132b6d60186fb93738fb20b5f  ./artifacts/bin/linux-amd64/velin-library-watch-helper
-1e63c02d096a25c938602914beb532c52120b67957bbb091ca6de5d2720c0812  ./artifacts/bin/linux-amd64/velin-media-gateway
+e31ba6c0645c32a58883a8ca56e685e49f9a4cf4973a06dc551bec51ac1500dd  ./artifacts/bin/linux-amd64/velin-dlna-helper
+e513d03ae722a50de43d35ceea4ac0109faee9c7342cf583288ebc07a9e6a0c4  ./artifacts/bin/linux-amd64/velin-library-watch-helper
+827120a01c30c7ec4fad02bc6f1dd9943abcf5493ec128f7dabacd44b55d9b96  ./artifacts/bin/linux-amd64/velin-media-gateway
 8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903  ./bin/FFMPEG-LICENSE
 47648882f0d05f944268977443d076d39e8f1ecdbc4ff7ea59e0fab8b48dde26  ./bin/docker-bootstrap
 e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99  ./bin/ffmpeg
@@ -905,9 +905,9 @@ f396015668dcab094ea872c502d502aa9b74e226cf8c5a394cb90ada8d4b4ad7  ./public/asset
 b41525d82800829525a3ae382af8c3acff9aa58b856e24f4acc7b64445989659  ./public/assets/vendor-radix-nnojf5BR.js
 0612e8f5185b4457fb1cb231bc44bf85a3dbed7ff8f2c15032012c05d5e376db  ./public/assets/wand-sparkles-CGOnI2ww.js
 69680c042c83ae7ee59ab7d4f8706839b883ece7c435013075c337b8c4811ad6  ./public/index.html
-309261b179d419c5033f6627ab186b126f01eacff86e3c6994e3284fe22a1770  ./release-assets/plugins/jackett-0.0.1.zip
-6035a9e36ed7c3998a3027c3006adf9a81e13520ad4c60a01f3ea6da7c8b5446  ./release-assets/plugins/lx-music-0.0.1.zip
-a258575b0c715eca357f8c9618b47d86efb3e75ac587cff7067ca9849723744c  ./release-assets/plugins/metadata-scrape-0.0.10.zip
+a5c55e57c9e62bd22c2af75fe011f64da9a18734f871d5ac5b1167d48b3b402c  ./release-assets/plugins/jackett-0.0.1.zip
+e76b56b0e3d39fcfd840416bfcddbbe43b926d9512f4fd5e498b14264a04b998  ./release-assets/plugins/lx-music-0.0.1.zip
+8fced97021a26ecdf8c6d28a22297c353b0c805fa26d4c7bc4d5736f6d2c4e1f  ./release-assets/plugins/metadata-scrape-0.0.10.zip
 2a1b1520fd011168aac35fd2471858f889dbd6eadfa89f756f43bd1256aa89e3  ./scripts/build-deployment-package.sh
 abb0047d9e8c4af12ed3b88492666b930acc34f09b7bd42a9e98ef9c30279a77  ./start.php
 dd35667cff0bc8d1add00cdebd5993cd81c22f05b215a24c258540d126093102  ./support/Request.php

@@ -1,4 +1,4 @@
-# Velin Music backend 0.1.22
+# Velin Music backend 0.1.23
 
 这是由 Velin Music 私有源码仓库自动导出的公开 backend 构建仓库。它只包含运行 backend 所需的 PHP
 代码、数据库迁移、镜像内静态前端文件，以及已经由私有 CI 构建并在 Alpine 验证的 amd64 Go Helper。
@@ -12,7 +12,7 @@
 ## 镜像
 
 ```text
-ghcr.io/<组织名>/velin-music:0.1.22
+ghcr.io/<组织名>/velin-music:0.1.23
 ```
 
 部署时请使用公开部署包中的 `compose.yaml`。部署包负责提供 SQLite、媒体、runtime 和插件目录，镜像
@@ -22,8 +22,8 @@ ghcr.io/<组织名>/velin-music:0.1.22
 
 ```bash
 docker buildx build --platform linux/amd64 \
-  --build-arg VELIN_VERSION=0.1.22 \
-  -t velin-music:0.1.22 .
+  --build-arg VELIN_VERSION=0.1.23 \
+  -t velin-music:0.1.23 .
 ```
 
 发布前必须确认 `/app/bin/velin-dlna-helper --version`、`/app/bin/velin-library-watch-helper --version`、

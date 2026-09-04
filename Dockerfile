@@ -64,6 +64,21 @@ RUN set -eux; \
     test -r /app/bin/opencc-data/tw2s.json; \
     test "$(printf '活著多好 - 陳奕迅\n' | /app/bin/opencc -c /app/bin/opencc-data/tw2s.json)" = '活着多好 - 陈奕迅'
 
+# 默认插件 ZIP 的真实版本由私有导出阶段生成，并由 manifest 作为唯一名称来源。镜像构建只复制该
+# 已通过清单校验的归档，不重新解压或重打包，避免 Dockerfile 的固定版本号落后于插件升级；缺失、多个
+# 同 key 归档或非法版本都会在构建阶段失败，不能生成带有错误初始化包的镜像。
+FROM alpine:3.22 AS initial-plugin-build
+WORKDIR /initial-plugins
+COPY --from=source-verifier /source/release-assets/plugins /plugins
+COPY --from=source-verifier /source/initial-plugins/manifest.json /manifest.json
+RUN set -eux; \
+    archive="$(sed -n 's/^[[:space:]]*"archive"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' /manifest.json)"; \
+    printf '%s\n' "$archive" | grep -Eq '^metadata-scrape-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.zip$'; \
+    test -f "/plugins/$archive"; \
+    mkdir -p /out; \
+    cp -- "/plugins/$archive" "/out/$archive"; \
+    test -s "/out/$archive"
+
 FROM media-runtime-base AS vendor
 COPY --from=composer:2.8 /usr/bin/composer /usr/local/bin/composer
 ENV COMPOSER_ALLOW_SUPERUSER=1
@@ -92,8 +107,7 @@ LABEL org.opencontainers.image.title="Velin Music" \
 WORKDIR /app
 COPY --from=vendor /app /app
 COPY --from=source-verifier /source/database/migrations /opt/velin/migrations
-COPY --from=source-verifier /source/initial-plugins/manifest.json /opt/velin/initial-plugins/manifest.json
-COPY --from=source-verifier /source/release-assets/plugins/metadata-scrape-0.0.4.zip /opt/velin/initial-plugins/metadata-scrape-0.0.4.zip
+COPY --from=initial-plugin-build /out/ /opt/velin/initial-plugins/
 COPY --from=source-verifier /source/docker/entrypoint.sh /usr/local/bin/velin-entrypoint
 RUN set -eux; \
     chmod 0755 /usr/local/bin/velin-entrypoint /app/bin/velin /app/bin/docker-bootstrap /app/bin/ffmpeg /app/bin/ffprobe \
