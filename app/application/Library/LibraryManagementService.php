@@ -25,9 +25,6 @@ use Throwable;
  */
 final class LibraryManagementService
 {
-    /** Stable seed identity; the path fallback preserves the restriction for upgraded old installs. */
-    private const DEFAULT_LIBRARY_ID = '01KYM200000000000000000001';
-
     public function __construct(
         private readonly LibraryPathInspector $paths = new LibraryPathInspector(),
         private readonly AuditLogger $auditLogger = new AuditLogger(),
@@ -101,7 +98,7 @@ final class LibraryManagementService
      * 登记一个不重叠的媒体库根，并授予创建者管理范围。
      *
      * 媒体根在事务前和即将插入时各解析一次，第二次可发现等待 SQLite 期间发生的挂载或软链接替换。
-     * `managed_cache` 只要求库可读，`adjacent` 要求库可写；两者都必须位于 `/storage/music`，且不能与固定缓存、
+     * `managed_cache` 只要求库可读，`adjacent` 要求库可写；目录必须是服务进程可见的真实目录，且不能与固定缓存、
      * 现有库根或升级期旧 inbox/watch 路径重叠。方法不读取媒体内容，失败回滚数据库且无文件副作用。
      *
      * @param array<string, mixed> $actor Authorized manage_library principal.
@@ -1224,8 +1221,7 @@ final class LibraryManagementService
     private function mapLibrary(stdClass $row, int $grantCount): array
     {
         $sourceType = (string) ($row->source_type ?? 'local');
-        $isDefault = (string) $row->id === self::DEFAULT_LIBRARY_ID
-            || (string) $row->root_path === StorageLayout::LIBRARY_ROOT;
+        $isDefault = (new DefaultLibraryService())->id() === (string) $row->id;
         return [
             'id' => (string) $row->id,
             'name' => (string) $row->name,

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace app\controller\Api\V1;
 
 use app\application\Auth\CredentialService;
+use app\application\Auth\LoginCaptchaService;
 use app\application\Auth\SessionService;
 use app\application\Auth\TrustedProxyAuthDenied;
 use app\application\Auth\TrustedProxyAuthService;
@@ -92,6 +93,16 @@ final class AuthController
         ], 200, $requestId);
     }
 
+    /** 返回当前匿名 Session 的登录验证码状态；首次访问始终返回未要求验证码。 */
+    public function captcha(Request $request): Response
+    {
+        $requestId = RequestContext::requestId();
+        return JsonResponseFactory::create([
+            'data' => (new LoginCaptchaService())->challenge($request->session()),
+            'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')],
+        ], 200, $requestId);
+    }
+
     /**
      * Verifies local credentials, rotates the Session ID, and returns the current user snapshot.
      *
@@ -108,6 +119,9 @@ final class AuthController
         $password = is_array($payload) && is_string($payload['password'] ?? null)
             ? $payload['password']
             : '';
+        $captchaAnswer = is_array($payload) && is_string($payload['captchaAnswer'] ?? null)
+            ? $payload['captchaAnswer']
+            : '';
 
         // Bound attacker-controlled input before Argon2 verification while retaining one public error.
         if (strlen($username) > 254 || strlen($password) > 1024) {
@@ -116,6 +130,16 @@ final class AuthController
         }
 
         try {
+            $captcha = new LoginCaptchaService();
+            if (!$captcha->verify($request->session(), $captchaAnswer)) {
+                return JsonResponseFactory::error(
+                    'LOGIN_CAPTCHA_REQUIRED',
+                    '请输入正确的验证码。',
+                    422,
+                    $requestId,
+                    ['captcha' => $captcha->challenge($request->session())],
+                );
+            }
             $decision = (new CredentialService())->authenticate($username, $password, $requestId);
             if ($decision->isRateLimited()) {
                 $response = JsonResponseFactory::error(
@@ -129,15 +153,18 @@ final class AuthController
                 return $response->withHeader('Retry-After', (string) $decision->retryAfterSeconds);
             }
             if (!$decision->authenticated || $decision->userId === null) {
+                $captcha->registerFailure($request->session());
                 return JsonResponseFactory::error(
                     'INVALID_CREDENTIALS',
                     '用户名或密码错误。',
                     401,
                     $requestId,
+                    ['captcha' => $captcha->challenge($request->session())],
                 );
             }
 
             $sessions = new SessionService();
+            $captcha->clear($request->session());
             $csrfToken = $sessions->establish($request, $decision->userId, $requestId);
             $user = $sessions->currentUser($request);
 

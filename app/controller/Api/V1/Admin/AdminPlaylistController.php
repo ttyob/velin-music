@@ -9,6 +9,7 @@ use app\application\Auth\AuthorizationDenied;
 use app\application\Auth\AuthorizationService;
 use app\application\Playlist\AdminPlaylistService;
 use app\application\Playlist\PlaylistAutoCompletionService;
+use app\application\Process\DynamicWorkerSupervisor;
 use app\application\Playlist\M3uImportService;
 use app\application\Playlist\M3uParser;
 use app\application\Playlist\PlatformPlaylistImportService;
@@ -231,13 +232,16 @@ final class AdminPlaylistController
         return $this->execute($request, static function (array $actor) use ($playlistId, $request): array {
             $payload = $request->post();
             if (!is_array($payload)) throw new PlaylistInvalid('自动补全请求无效。');
-            return (new PlaylistAutoCompletionService())->update(
+            $result = (new PlaylistAutoCompletionService())->update(
                 $playlistId,
                 $payload,
                 (string) $actor['id'],
                 RequestContext::requestId(),
                 (bool) ($actor['isSuperAdmin'] ?? false),
             );
+            if (($result['autoCompletion']['enabled'] ?? false) === true) self::startCompletionWorker();
+            else self::stopCompletionWorkerIfUnused();
+            return $result;
         });
     }
 
@@ -250,11 +254,43 @@ final class AdminPlaylistController
                 || array_diff(array_keys($payload), ['expectedVersion']) !== []) {
                 throw new PlaylistInvalid('自动补全重置请求无效。');
             }
-            return (new PlaylistAutoCompletionService())->reset(
+            $result = (new PlaylistAutoCompletionService())->reset(
                 $playlistId, $payload['expectedVersion'], (string) $actor['id'], RequestContext::requestId(),
                 (bool) ($actor['isSuperAdmin'] ?? false),
             );
+            if (($result['playlist']['autoCompletion']['enabled'] ?? false) === true) self::startCompletionWorker();
+            return $result;
         });
+    }
+
+    /** 在补全任务事务提交后幂等启动长期消费者；启动失败不影响已保存的歌单任务。 */
+    private static function startCompletionWorker(): void
+    {
+        try {
+            (new DynamicWorkerSupervisor())->ensureStarted('playlist-completion');
+        } catch (Throwable $throwable) {
+            Log::warning('Dynamic playlist completion worker start failed.', [
+                'worker' => 'velin-playlist-completion', 'exception_class' => $throwable::class,
+            ]);
+        }
+    }
+
+    /**
+     * 仅在所有歌单都关闭自动补全后请求长期消费者退出。
+     *
+     * 单个歌单关闭不能影响其他仍开启的歌单；查询使用数据库当前提交事实，Worker 停止只发送信号，已
+     * 落库任务仍保留可重试状态。并发开启请求即使与此检查交错，也会再次幂等拉起 Worker。
+     */
+    private static function stopCompletionWorkerIfUnused(): void
+    {
+        try {
+            if (Db::table('playlists')->where('auto_completion_enabled', 1)->exists()) return;
+            (new DynamicWorkerSupervisor())->stop('playlist-completion');
+        } catch (Throwable $throwable) {
+            Log::warning('Dynamic playlist completion worker stop failed.', [
+                'worker' => 'velin-playlist-completion', 'exception_class' => $throwable::class,
+            ]);
+        }
     }
 
     /** 返回指定用户或系统歌单的脱敏补全日志；读取支持分页，不暴露插件句柄、路径或第三方响应。 */

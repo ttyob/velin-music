@@ -1,20 +1,18 @@
-# Velin Music Docker 部署包 <VERSION>
+# Velin Music Docker 精简部署包 0.1.27
 
-这个目录是公开发布的部署包，不包含 Velin Music 私有源码。它只通过 Docker 拉取已经由 CI 构建的
-backend 镜像 `<IMAGE>`；镜像已经包含 PHP 应用、前端静态文件、FFmpeg、FFprobe 和 Go Helper。当前公开
-平台为 `linux/amd64`，Release 中带二进制的资源插件也按同一平台验证。
+这个目录只包含 Docker Compose、初始化脚本、OwnTone 配置和空持久目录，不重复包含 GitHub 标签已经
+提供的公开源码。Compose 只拉取已经由 CI 构建的 backend 镜像 `ghcr.io/ttyob/velin-music:0.1.27`，不会在部署主机重新安装依赖
+或构建源码。当前公开平台为 `linux/amd64`。
 
 ## 启动
 
 ```bash
-cp .env.docker.example .env
-docker login <镜像仓库>
-docker compose pull
 docker compose up -d --wait
 docker compose ps
 ```
 
-解压后可先执行 `sha256sum -c CONTENTS.sha256`。部署包中的 Compose 和环境模板已经固定到镜像 digest，
+公开 GHCR 镜像不要求登录；使用私有镜像源时才需要先执行 `docker login`。解压后可先执行
+`sha256sum -c CONTENTS.sha256`。部署包中的 Compose 和环境模板已经固定到镜像 digest，
 不会因远端同名标签变化而静默升级。
 
 首次启动时 backend entrypoint 会在 `.env` 缺失或相关值未初始化时生成两把独立密钥和一个指标 Bearer Token。已有有效值不会
@@ -28,9 +26,14 @@ docker compose ps
 
 ## 发布包边界
 
-包内只有 Compose、初始化脚本、OwnTone 配置和空的数据目录；不包含 `frontend-new`、Go 源码、PHP
-源码、测试、依赖缓存、SQLite 数据、媒体文件、日志或任何密钥。升级时应使用新 Release 提供的 digest
-部署包；数据库迁移后的回滚必须同时恢复升级前冷备份，不能只改回镜像标签。
+包内不包含 PHP/前端/Go 源码、测试、依赖缓存、SQLite 数据、媒体文件、日志或任何密钥。完整公开源码由
+仓库及 GitHub 自动生成的 Source code 附件提供。升级时应使用新 Release 的 digest 固定部署包；数据库
+迁移后的回滚必须同时恢复升级前冷备份，不能只改回镜像标签。
 
 不要执行 `docker compose down -v`，否则会删除 Redis 持久卷。生产密钥由 entrypoint 生成在
-`docker-data/config/.env`，不得提交到公开仓库或写入镜像；部署根 `.env` 只负责 Compose 镜像选择。
+`docker-data/config/.env`，不得提交到公开仓库或写入镜像；部署根 `.env` 只是可选的 Compose 镜像覆盖
+配置，默认启动不要求创建。
+
+默认仓库无法访问时，可在部署根 `.env` 中设置 `VELIN_BACKEND_IMAGE`、`VELIN_REDIS_IMAGE` 和
+`VELIN_OWNTONE_IMAGE`，再执行 Compose。覆盖值只应使用发布方同步并公布校验信息的可信镜像；不得把
+来源不明的公共加速地址作为生产依赖。首个正式稳定版发布前必须提供国内可访问的受信镜像地址。

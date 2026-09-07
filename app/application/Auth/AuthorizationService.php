@@ -51,6 +51,9 @@ final readonly class AuthorizationService
         if ($actor === null) {
             throw new AuthenticationRequired('Authentication is required.');
         }
+        if (($actor['librarySetupRequired'] ?? false) === true) {
+            throw new LibrarySetupRequired('A default music library must be configured first.');
+        }
 
         $capabilities = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];
         if (!in_array($capability, $capabilities, true)) {
@@ -73,6 +76,9 @@ final readonly class AuthorizationService
     {
         $actor = $this->currentActor($request);
         if ($actor === null) throw new AuthenticationRequired('Authentication is required.');
+        if (($actor['librarySetupRequired'] ?? false) === true) {
+            throw new LibrarySetupRequired('A default music library must be configured first.');
+        }
         if ($capabilities === []) throw new AuthorizationDenied('No capability was configured.');
         $owned = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];
         foreach ($capabilities as $capability) {

@@ -8,6 +8,7 @@ use app\http\CsrfTokenManager;
 use app\http\RequestContext;
 use app\infrastructure\Audit\AuditLogger;
 use app\application\Library\LibraryAccessResolver;
+use app\application\Library\DefaultLibraryService;
 use app\application\Notification\NotificationPublisher;
 use app\application\Theme\ThemeService;
 use stdClass;
@@ -257,6 +258,7 @@ final class SessionService
             'displayName' => (string) $row->display_name,
             'email' => $row->email === null ? null : (string) $row->email,
             'isSuperAdmin' => $isSuperAdmin,
+            'librarySetupRequired' => !(new DefaultLibraryService())->isConfigured(),
             'permissionVersion' => (int) $row->permission_version,
             'capabilities' => $this->capabilityResolver->resolve((string) $row->id, $isSuperAdmin),
             'libraries' => $this->libraryAccessResolver->resolve((string) $row->id, $isSuperAdmin),

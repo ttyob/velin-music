@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace app\application\Dlna;
 
 use app\application\System\PublicUrlConfig;
+use app\application\System\DlnaSettingsService;
 use app\http\RequestContext;
 use app\infrastructure\Audit\AuditLogger;
 use app\infrastructure\Dlna\RedisDlnaDeviceLease;
@@ -31,6 +32,7 @@ final readonly class DlnaService
         private DlnaDeviceLease $leases = new RedisDlnaDeviceLease(),
         private DlnaDeviceRouteCache $routes = new RedisDlnaDeviceRouteCache(),
         private DlnaAccountStateService $accountState = new DlnaAccountStateService(),
+        private DlnaSettingsService $settings = new DlnaSettingsService(),
     ) {
     }
 
@@ -381,12 +383,10 @@ final readonly class DlnaService
         ];
     }
 
-    /** 默认启用后仍同时要求播放与共享设备控制能力；任何一项撤销都会在下一次命令立即生效。 */
+    /** 全站开关与账号播放/投放能力必须同时满足；任何一项撤销都会在下一次命令立即生效。 */
     private function assertEnabledAndAuthorized(array $actor): void
     {
-        if (filter_var(getenv('VELIN_DLNA_ENABLED') ?: 'true', FILTER_VALIDATE_BOOL) !== true) {
-            throw new DlnaUnavailable('DLNA_DISABLED', 'DLNA 功能未启用。');
-        }
+        $this->settings->assertEnabled();
         $capabilities = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];
         if (!is_string($actor['id'] ?? null) || !in_array('play', $capabilities, true)
             || !in_array('cast', $capabilities, true)) {

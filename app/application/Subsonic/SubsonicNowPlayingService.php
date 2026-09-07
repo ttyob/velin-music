@@ -14,7 +14,7 @@ use DateTimeZone;
  * The current privacy model exposes only the caller's own two-minute heartbeat window. It does not
  * enumerate other accounts or turn global play permission into activity visibility. HistoryService
  * reapplies live media grants before this adapter maps path-free song data, and reads do not extend
- * session lifetime, increment counts, or report an external scrobble.
+ * session lifetime or increment counts.
  */
 final readonly class SubsonicNowPlayingService
 {

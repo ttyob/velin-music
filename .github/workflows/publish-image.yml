@@ -157,7 +157,7 @@ jobs:
             "$asset_root"/SHA256SUMS \
             --verify-tag \
             --title "Velin Music $RELEASE_VERSION" \
-            --notes "Velin Music $RELEASE_VERSION：linux/amd64 镜像和 digest 固定部署包。公开插件包请从独立插件仓库获取。"
+            --notes "Velin Music $RELEASE_VERSION：linux/amd64 镜像和 digest 固定精简部署包；源码使用 GitHub 自动生成的 Source code 附件。公开插件包请从独立插件仓库获取。"
 
   # 服务器部署是可选的外部副作用；只有仓库变量显式设置 DEPLOY_ENABLED=true 才会执行。部署先拉取新
   # digest，再停 backend 制作 SQLite 冷备份；停止后的任一步骤失败都恢复旧环境。新 backend 已经启动

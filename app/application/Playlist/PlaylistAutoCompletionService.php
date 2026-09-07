@@ -201,13 +201,16 @@ final readonly class PlaylistAutoCompletionService
      * 手动添加歌曲发生在歌单服务事务之后，因此这里使用 `(playlist_id, position)` 幂等插入；开关关闭时
      * 不创建任务。目标库和权限沿用开启开关时的规则，没有可管理本地库则创建明确失败任务，不写任意路径。
      * 该方法供手动添加接口调用，也可安全重复调用，不会重置已达到三次上限的历史任务。
+     *
+     * @return bool 仅当歌单开关已开启且任务表可用时返回 true，供调用方按需启动长期 Worker。
      */
-    public function enqueueMissingForPlaylist(string $playlistId, string $actorId, bool $isSuperAdmin = false): void
+    public function enqueueMissingForPlaylist(string $playlistId, string $actorId, bool $isSuperAdmin = false): bool
     {
-        if (!Db::connection()->getSchemaBuilder()->hasTable('playlist_auto_completion_jobs')) return;
+        if (!Db::connection()->getSchemaBuilder()->hasTable('playlist_auto_completion_jobs')) return false;
         if (!Db::table('playlists')->where('id', $playlistId)->whereIn('scope', ['user', 'system'])
-            ->where('auto_completion_enabled', 1)->exists()) return;
+            ->where('auto_completion_enabled', 1)->exists()) return false;
         $this->enqueueMissing($playlistId, $actorId, $isSuperAdmin, gmdate('Y-m-d\TH:i:s\Z'));
+        return true;
     }
 
     /**

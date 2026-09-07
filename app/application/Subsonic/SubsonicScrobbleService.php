@@ -6,7 +6,6 @@ namespace app\application\Subsonic;
 
 use app\application\Media\MediaQueryService;
 use app\application\Playback\ListeningTimeService;
-use app\application\Scrobble\ScrobbleOutbox;
 use stdClass;
 use support\Db;
 use Symfony\Component\Uid\Ulid;
@@ -17,15 +16,13 @@ use Throwable;
  *
  * `submission=false` updates current activity without incrementing play count. `submission=true`
  * represents the protocol's explicit completed-listen assertion and increments at most once for the
- * deterministic user/client/song/time occurrence. It does not contact Last.fm/ListenBrainz; external
- * scrobbling remains a separate P1 outbox integration outside this short SQLite transaction. Unknown
+ * deterministic user/client/song/time occurrence. It does not contact external services. Unknown
  * duration remains zero and uses a conservative internal threshold; it is never rewritten as 1ms.
  */
 final readonly class SubsonicScrobbleService
 {
     public function __construct(
         private MediaQueryService $media = new MediaQueryService(),
-        private ScrobbleOutbox $scrobbleOutbox = new ScrobbleOutbox(),
         private ListeningTimeService $listeningTime = new ListeningTimeService(),
     ) {
     }
@@ -188,16 +185,6 @@ final readonly class SubsonicScrobbleService
                 'play_count_after' => $playCount,
                 'status_after' => $status,
             ]);
-            // Subsonic submission=false 只排队 Now Playing，submission=true 只排队正式 scrobble；二者
-            // 与内部计数处于同一短事务，远端网络由独立 Worker 处理。确定性协议 eventId 与任务唯一键
-            // 共同保证客户端重试不会重复上报，且任务快照不包含客户端名、用户路径或文件定位信息。
-            $this->scrobbleOutbox->enqueue(
-                $userId,
-                'subsonic:' . $playbackEventId,
-                $submission ? 'scrobble' : 'now_playing',
-                $song,
-                $occurredAt,
-            );
             $pdo->exec('COMMIT');
             $transactionOpen = false;
 

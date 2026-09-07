@@ -19,6 +19,11 @@ use app\application\System\NetworkProxySettingsConflict;
 use app\application\System\NetworkProxySettingsInvalid;
 use app\application\System\NetworkProxySettingsService;
 use app\application\System\NetworkProxySettingsUnavailable;
+use app\application\System\DlnaSettingsConflict;
+use app\application\System\DlnaSettingsInvalid;
+use app\application\System\DlnaSettingsService;
+use app\application\System\DlnaSettingsUnavailable;
+use app\application\Dlna\DlnaHelperSupervisor;
 use app\application\System\RuntimeMaintenanceInvalid;
 use app\application\System\RuntimeMaintenanceService;
 use app\application\System\RuntimeMaintenanceUnavailable;
@@ -142,6 +147,45 @@ final class SystemSettingsController
         return $this->execute($request, static fn (): array => (new SystemLimitSettingsService())->get());
     }
 
+    /** 读取全站 DLNA 开关；仅 `manage_system` 管理员可见，响应不包含 helper 路径或设备信息。 */
+    public function showDlna(Request $request): Response
+    {
+        return $this->execute($request, static fn (): array => (new DlnaSettingsService())->get());
+    }
+
+    /** 原子更新全站 DLNA 开关；保存本身不执行 SSDP/SOAP，后续请求按新状态决定是否按需调用 helper。 */
+    public function updateDlna(Request $request): Response
+    {
+        return $this->execute($request, static function (array $actor) use ($request): array {
+            $payload = $request->post();
+            if (!is_array($payload)) {
+                throw new DlnaSettingsInvalid('DLNA 设置参数无效。');
+            }
+            $updated = (new DlnaSettingsService())->update($payload, (string) $actor['id'], RequestContext::requestId());
+            try {
+                $supervisor = new DlnaHelperSupervisor();
+                $running = true;
+                if ($updated['enabled']) {
+                    $running = $supervisor->start();
+                } else {
+                    $supervisor->stop();
+                }
+                if ($updated['enabled'] && $running !== true) {
+                    Log::warning('DLNA helper did not become ready after enabling.', [
+                        'request_id' => RequestContext::requestId(),
+                    ]);
+                }
+            } catch (Throwable $lifecycleFailure) {
+                Log::warning('DLNA helper lifecycle reconciliation failed.', [
+                    'request_id' => RequestContext::requestId(),
+                    'enabled' => $updated['enabled'],
+                    'exception_class' => $lifecycleFailure::class,
+                ]);
+            }
+            return $updated;
+        });
+    }
+
     /**
      * 严格接收完整全局限制对象并执行原子版本替换。
      *
@@ -226,6 +270,9 @@ final class SystemSettingsController
             if ($throwable instanceof NetworkProxySettingsInvalid) {
                 return JsonResponseFactory::error('NETWORK_PROXY_VALIDATION_FAILED', '代理配置参数无效。', 422, $requestId);
             }
+            if ($throwable instanceof DlnaSettingsInvalid) {
+                return JsonResponseFactory::error('DLNA_SETTINGS_VALIDATION_FAILED', 'DLNA 设置参数无效。', 422, $requestId);
+            }
             if ($throwable instanceof RuntimeMaintenanceInvalid) {
                 return JsonResponseFactory::error('RUNTIME_MAINTENANCE_VALIDATION_FAILED', '清理分类无效。', 422, $requestId);
             }
@@ -244,6 +291,9 @@ final class SystemSettingsController
             if ($throwable instanceof NetworkProxySettingsConflict) {
                 return JsonResponseFactory::error('NETWORK_PROXY_VERSION_CONFLICT', '代理配置已变化，请刷新后重试。', 409, $requestId);
             }
+            if ($throwable instanceof DlnaSettingsConflict) {
+                return JsonResponseFactory::error('DLNA_SETTINGS_VERSION_CONFLICT', 'DLNA 设置已变化，请刷新后重试。', 409, $requestId);
+            }
             if ($throwable instanceof MetadataScrapePolicyConflict) {
                 return JsonResponseFactory::error('METADATA_SCRAPE_POLICY_VERSION_CONFLICT', '刮削配置已变化，请刷新后重试。', 409, $requestId);
             }
@@ -251,6 +301,7 @@ final class SystemSettingsController
             $code = $throwable instanceof BasicSystemSettingsUnavailable
                 || $throwable instanceof SystemLimitSettingsUnavailable
                 || $throwable instanceof NetworkProxySettingsUnavailable
+                || $throwable instanceof DlnaSettingsUnavailable
                 || $throwable instanceof MetadataScrapePolicyUnavailable
                 ? 'SYSTEM_SETTINGS_UNAVAILABLE'
                 : 'SYSTEM_SETTINGS_REQUEST_FAILED';

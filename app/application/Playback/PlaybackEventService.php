@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace app\application\Playback;
 
 use app\application\Media\MediaQueryService;
-use app\application\Scrobble\ScrobbleOutbox;
 use app\application\ResourcePlugin\Contract\PluginDomainEvent;
 use app\application\ResourcePlugin\PluginEventPublisher;
 use DateTimeImmutable;
@@ -21,13 +20,12 @@ use Throwable;
  *
  * 服务在 SQLite 加锁前证明媒体授权，并在用户/播放器范围内去重。有效收听只累计正向位置差，且受服务端
  * 经过时间、五秒投递容差和单事件 30 秒上限共同限制，避免拖到结尾直接计次。时长未知时保留合法位置并
- * 使用四分钟保守阈值；事务内不读取媒体，也不请求外部 scrobble 服务，失败整体回滚。
+ * 使用四分钟保守阈值；事务内不读取媒体，也不请求外部服务，失败整体回滚。
  */
 final class PlaybackEventService
 {
     public function __construct(
         private readonly MediaQueryService $media = new MediaQueryService(),
-        private readonly ScrobbleOutbox $scrobbleOutbox = new ScrobbleOutbox(),
         private readonly PlaybackPrefetchJobService $prefetch = new PlaybackPrefetchJobService(),
         private readonly ListeningTimeService $listeningTime = new ListeningTimeService(),
         private readonly PluginEventPublisher $pluginEvents = new PluginEventPublisher(),
@@ -214,25 +212,12 @@ final class PlaybackEventService
             if ($input->type === 'started') {
                 $this->prefetch->enqueue($userId, $input->playerId, $songId);
             }
-            // 外部投递与内部播放事实使用同一事务：started 只更新 Now Playing，达到账号级计数阈值的首个
-            // 事件才产生正式 scrobble。outbox 冻结无路径元数据且通过连接+事件唯一键去重，网络请求由
-            // 独立 Worker 在提交后执行，因此第三方故障既不能回滚内部播放统计，也不会阻塞播放器心跳。
-            if ($input->type === 'started') {
-                $this->scrobbleOutbox->enqueue(
-                    $userId, 'web:' . (string) $event['id'], 'now_playing', $song, $occurredAt,
-                );
-            }
-            if ($countedNow) {
-                $this->scrobbleOutbox->enqueue(
-                    $userId, 'web:' . (string) $event['id'], 'scrobble', $song, $occurredAt,
-                );
-            }
             $pdo->exec('COMMIT');
             $transactionOpen = false;
 
             if ($countedNow) {
                 // 只对首次达到服务端有效播放阈值的事件通知插件；客户端 completed 但未达到阈值不伪造完成。
-                // Redis 写发生在 COMMIT 之后，失败不会回滚播放统计或 Scrobble outbox。
+                // Redis 写发生在 COMMIT 之后，失败不会回滚已经提交的播放统计。
                 $this->pluginEvents->publish(
                     PluginDomainEvent::PLAYBACK_COMPLETED,
                     'song',

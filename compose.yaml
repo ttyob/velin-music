@@ -1,0 +1,124 @@
+name: velin-music
+
+x-backend-image: &backend-image
+  # 公开 clone 与精简部署包默认只拉取 CI 已构建并签名的镜像；公开源码仅供审计或复建，不挂入容器。
+  image: ${VELIN_BACKEND_IMAGE:-ghcr.io/ttyob/velin-music:0.1.27}
+
+services:
+  redis:
+    image: ${VELIN_REDIS_IMAGE:-redis:7.4-alpine}
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --bind
+      - 127.0.0.1
+      - --protected-mode
+      - "yes"
+      - --port
+      - "16379"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60"
+      - "1"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 16379 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # SSDP 使用 239.255.255.250:1900 UDP 多播；host 网络让 DLNA helper 直接加入宿主局域网。
+    # Redis 仍只绑定 127.0.0.1，并使用独立端口，不能因 host 模式向局域网暴露。
+    network_mode: host
+
+  owntone:
+    image: ${VELIN_OWNTONE_IMAGE:-owntone/owntone:29.3@sha256:6a88589edc4dd9c438da62a18a25374d3e6e01457745f241a22baf88c43c9582}
+    restart: unless-stopped
+    # AirPlay 发现和时钟同步需要 mDNS/UDP；host 网络与 DLNA 共用，JSON API 对非 localhost 固定拒绝。
+    network_mode: host
+    volumes:
+      - type: bind
+        source: ./docker/owntone/owntone.conf
+        target: /etc/owntone/owntone.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - owntone-cache:/var/cache/owntone
+      # OwnTone 不扫描 Velin 媒体，/srv/media 只满足其启动时的目录契约；使用极小只读占位 tmpfs，
+      # 避免为一个永远为空的目录增加宿主持久化映射，也不给 companion 暴露数据库或音乐库。
+      - type: tmpfs
+        target: /srv/media
+        read_only: true
+        tmpfs:
+          size: 1048576
+          mode: 0555
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3689/api/player >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  backend:
+    <<: *backend-image
+    restart: unless-stopped
+    init: true
+    # Webman 以 root 读取不同宿主 UID 的媒体挂载；容器仍不启用 privileged，也不挂载 Docker Socket、
+    # 设备或宿主进程命名空间。该权限只解决明确挂载目录的文件访问，不扩大容器可见范围。
+    user: "0:0"
+    depends_on:
+      redis:
+        condition: service_healthy
+      owntone:
+        condition: service_healthy
+    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 公开部署与源码部署使用同一两根布局：应用状态统一进入 /data，音乐、下载和回收站进入 /storage。
+      # 两个宿主根由公开 clone 或精简部署包预置，缺失时必须失败，不能静默生成空库或空音乐目录。
+      - type: bind
+        source: ./docker-data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./storage
+        target: /storage
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          php -r 'exit(PHP_VERSION_ID >= 80300 && PHP_VERSION_ID < 80400 && extension_loaded("gd") && extension_loaded("openssl") && trim((string) ini_get("disable_functions")) === "" ? 0 : 1);'
+          && /app/bin/ffprobe -version >/dev/null 2>&1
+          && /app/bin/ffmpeg -version >/dev/null 2>&1
+          && node --version >/dev/null 2>&1
+          && /app/bin/velin-library-watch-helper --version >/dev/null 2>&1
+          && /app/bin/velin-dlna-helper --version >/dev/null 2>&1
+          && test "$$(/app/bin/velin-media-gateway --version)" = 'velin-media-gateway protocol=1 static=1'
+          && test -r /app/bin/webdav-range-proxy.php
+          && php -l /app/bin/webdav-range-proxy.php >/dev/null 2>&1
+          && test -S /app/runtime/velin-dlna-helper.sock
+          && /app/bin/fpcalc -version >/dev/null 2>&1
+          && test -x /app/bin/opencc
+          && test -r /app/bin/opencc-data/t2s.json
+          && test -r /app/public/index.html
+          && test "$$(printf '周杰倫 - 稻香 Live現場版\n' | /app/bin/opencc -c /app/bin/opencc-data/t2s.json)" = '周杰伦 - 稻香 Live现场版'
+          && wget -qO- http://127.0.0.1:8787/api/v1/health >/dev/null
+          && wget -qS -O /dev/null http://127.0.0.1:8787/index.html 2>&1 | grep -Fi 'X-Velin-Static-Delivery: go' >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  owntone-cache:
+  redis-data:

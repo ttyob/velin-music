@@ -53,8 +53,6 @@ final readonly class UserBulkService
             'tokensToRevoke' => $facts['tokensToRevoke'],
             'uploadsToCancel' => $facts['uploadsToCancel'],
             'uploadsToRequestCancel' => $facts['uploadsToRequestCancel'],
-            'exportsToCancel' => $facts['exportsToCancel'],
-            'exportsToRequestCancel' => $facts['exportsToRequestCancel'],
             'playbackLeasesToRelease' => $facts['playbackLeasesToRelease'],
             'libraries' => $facts['libraries'],
             'grantAdds' => $facts['grantAdds'],
@@ -128,8 +126,6 @@ final readonly class UserBulkService
                         'tokensRevoked' => $revocation['tokensRevoked'] ?? 0,
                         'uploadsCancelled' => $revocation['uploadsCancelled'] ?? 0,
                         'uploadsCancelRequested' => $revocation['uploadsCancelRequested'] ?? 0,
-                        'exportsCancelled' => $revocation['exportsCancelled'] ?? 0,
-                        'exportsCancelRequested' => $revocation['exportsCancelRequested'] ?? 0,
                     ]);
                 $this->notifications->publishPermissionChange(
                     $targetId,
@@ -228,8 +224,6 @@ final readonly class UserBulkService
             'tokensToRevoke' => 0,
             'uploadsToCancel' => 0,
             'uploadsToRequestCancel' => 0,
-            'exportsToCancel' => 0,
-            'exportsToRequestCancel' => 0,
             'playbackLeasesToRelease' => 0,
             'snapshot' => [],
         ];
@@ -269,8 +263,6 @@ final readonly class UserBulkService
             'tokensToRevoke' => $deactivationImpact['tokensToRevoke'],
             'uploadsToCancel' => $deactivationImpact['uploadsToCancel'],
             'uploadsToRequestCancel' => $deactivationImpact['uploadsToRequestCancel'],
-            'exportsToCancel' => $deactivationImpact['exportsToCancel'],
-            'exportsToRequestCancel' => $deactivationImpact['exportsToRequestCancel'],
             'playbackLeasesToRelease' => $deactivationImpact['playbackLeasesToRelease'],
             'libraries' => $selectedLibraries,
             'manageableLibraries' => $manageable,

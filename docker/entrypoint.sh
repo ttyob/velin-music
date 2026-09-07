@@ -89,10 +89,8 @@ test "$(printf '活著多好 - 陳奕迅\n' | /app/bin/opencc -c /app/bin/opencc
 test -r /app/bin/webdav-range-proxy.php
 php -l /app/bin/webdav-range-proxy.php >/dev/null 2>&1
 
-# 单个 helper 进程通过 0600 Unix Socket 服务所有 Webman Worker；运行路径由镜像内置，不要求新增 .env。
-# 进程长驻只用于复用按 UDN 建立的设备上下文，音响在最后活动 10 分钟后会自动取消订阅并释放连接缓存。
-# helper 只删除遗留 Socket；若进程后来退出，PHP 会安全回退一次性执行，已写入 Socket 的命令不得重试。
-/app/bin/velin-dlna-helper --socket=/app/runtime/velin-dlna-helper.sock &
+# DLNA 默认关闭以避免闲置 helper 占用内存。管理员在后台开启后，系统设置接口动态启动唯一常驻 daemon；
+# 关闭设置时发送停止信号并清理 Socket，已写入 Socket 的命令不得重试。
 
 # exec gives Workerman PID 1 signal ownership through Docker's init process, allowing graceful lease
 # release and SQLite checkpoint behavior during compose stop/restart.

@@ -14,8 +14,8 @@ use support\Db;
  * 读取管理员明确获准查看的播放隐私投影（ADMIN-USER-005）。
  *
  * `view_play_privacy` 只解除“可否查看播放活动”边界，不扩大媒体对象范围；所有歌曲仍与操作者当前
- * manage 级音乐库求交集。指定账号历史和导出任务还要求 `manage_users`，避免只有播放隐私能力的
- * 角色枚举账号。服务永不返回路径、文件身份、Session/Cookie/令牌、导出文件名或摘要。
+ * manage 级音乐库求交集。指定账号历史还要求 `manage_users`，避免只有播放隐私能力的角色枚举账号。
+ * 服务永不返回路径、文件身份、Session/Cookie 或令牌。
  */
 final readonly class AdminPlaybackPrivacyService
 {
@@ -108,30 +108,6 @@ final readonly class AdminPlaybackPrivacyService
             ];
         }
         return ['history' => $history, 'total' => $total, 'limit' => $limit, 'offset' => $offset];
-    }
-
-    /** @return array{jobs:list<array<string,mixed>>} */
-    public function exports(array $actor, string $userId): array
-    {
-        $this->requireTarget($actor, $userId);
-        if (!Db::connection()->getSchemaBuilder()->hasTable('personal_data_export_jobs')) return ['jobs' => []];
-        /** @var list<stdClass> $rows */
-        $rows = Db::table('personal_data_export_jobs')->where('user_id', $userId)
-            ->orderByDesc('created_at')->orderByDesc('id')->limit(30)->get([
-                'id', 'status', 'phase', 'record_count', 'byte_size', 'attempt', 'error_code',
-                'created_at', 'started_at', 'finished_at', 'expires_at',
-            ])->all();
-        return ['jobs' => array_map(static fn (stdClass $row): array => [
-            'id' => (string) $row->id, 'status' => (string) $row->status, 'phase' => (string) $row->phase,
-            'recordCount' => (int) $row->record_count,
-            'byteSize' => $row->byte_size === null ? null : (int) $row->byte_size,
-            'attempt' => (int) $row->attempt,
-            'errorCode' => $row->error_code === null ? null : (string) $row->error_code,
-            'createdAt' => (string) $row->created_at,
-            'startedAt' => $row->started_at === null ? null : (string) $row->started_at,
-            'finishedAt' => $row->finished_at === null ? null : (string) $row->finished_at,
-            'expiresAt' => $row->expires_at === null ? null : (string) $row->expires_at,
-        ], $rows)];
     }
 
     /** 指定账号读取必须同时具备账号管理和隐私能力，并验证目标仍存在但不读取其秘密。 */

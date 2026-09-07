@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace app\application\Auth;
 
 use app\application\Library\LibraryAccessResolver;
+use app\application\Library\DefaultLibraryService;
 use app\application\Theme\ThemeService;
 use stdClass;
 use support\Db;
@@ -55,6 +56,7 @@ final readonly class UserActorProjector
             'displayName' => (string) $row->display_name,
             'email' => $row->email === null ? null : (string) $row->email,
             'isSuperAdmin' => $isSuper,
+            'librarySetupRequired' => !(new DefaultLibraryService())->isConfigured(),
             'permissionVersion' => (int) $row->permission_version,
             'capabilities' => $this->capabilities->resolve((string) $row->id, $isSuper),
             'libraries' => $this->libraries->resolve((string) $row->id, $isSuper),

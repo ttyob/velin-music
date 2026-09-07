@@ -104,7 +104,7 @@ final class SubsonicSystemService
      * `username` is required by the protocol but cannot be used to enumerate another account in
      * this first compatibility slice. A mismatch uses the same not-found exception regardless of
      * whether the requested identity exists. Folder IDs repeat the live authorization snapshot.
-     * Unsupported podcast, comments, video conversion, and Subsonic scrobble abilities remain false.
+     * Unsupported podcast, comments, video conversion, and external scrobble abilities remain false.
      *
      * @param array<string, mixed> $actor Authenticated principal from SubsonicAuthenticator.
      * @throws SubsonicRequestInvalid Missing, array, empty, or oversized username parameter.

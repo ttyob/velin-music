@@ -10,7 +10,7 @@ use app\application\Storage\StorageLayout;
  * Resolves and compares library roots without enumerating their contents.
  *
  * No file is created, modified, opened, or deleted. realpath collapses `..` components and root
- * symlinks before containment checks, preventing two aliases from indexing the same subtree.
+ * symlinks before identity checks, preventing two aliases from indexing the same subtree.
  * Child symlinks remain governed by each library's explicit symlink policy during future scans.
  */
 final class LibraryPathInspector
@@ -18,10 +18,11 @@ final class LibraryPathInspector
     public const MEDIA_ROOT = StorageLayout::LIBRARY_ROOT;
 
     /**
-     * 创建一个只允许解析固定音乐库根的路径检查器。
+     * 创建音乐库路径检查器。
      *
-     * 生产代码不传参数，始终使用 `/storage/music`；可选参数仅供隔离测试注入临时目录，不能来自请求、
-     * 环境变量或数据库。检查器不创建目录，根缺失、为链接或不可访问时由解析方法失败关闭。
+     * 目录不再绑定某个固定容器前缀；Docker 只允许访问实际挂载进容器的目录，原生 FPK 可直接访问宿主
+     * 文件系统。可选参数仅为旧测试保留，不参与安全判断。检查器不创建目录，根缺失、为链接或不可访问
+     * 时由解析方法失败关闭。
      */
     public function __construct(private readonly string $allowedRoot = self::MEDIA_ROOT)
     {
@@ -56,25 +57,17 @@ final class LibraryPathInspector
     }
 
     /**
-     * 解析 `/storage/music` 下的已存在目录，并按资源策略决定是否要求写权限。
+     * 解析服务进程可见的已存在目录，并按资源策略决定是否要求写权限。
      *
      * `managed_cache` 音乐库只需可读，派生文件写入独立缓存；`adjacent` 必须可写，因为发布歌词时会
-     * 在音频父目录创建临时文件。无论模式如何，Docker 路径都不能逃出独立音乐库根。本方法不创建目录，
-     * 失败无文件系统副作用；调用方在提交配置的写事务内必须再次解析，以防挂载或软链接竞态。
+     * 在音频父目录创建临时文件。本方法不创建目录，失败无文件系统副作用；调用方在提交配置的写事务
+     * 内必须再次解析，以防挂载或软链接竞态。
      *
      * @throws LibraryPathInvalid 当目录不存在、越界、不可读或缺少所需写权限时。
      */
     public function resolveMediaDirectory(string $path, string $role, bool $requiresWrite): string
     {
         $resolved = $this->resolve($path);
-        $mediaRoot = realpath($this->allowedRoot);
-        if ($mediaRoot === false || !is_dir($mediaRoot)) {
-            throw new LibraryPathInvalid('容器音乐库根目录 /storage/music 不可用。');
-        }
-        $mediaPrefix = rtrim($mediaRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
-        if (!str_starts_with($resolved . DIRECTORY_SEPARATOR, $mediaPrefix)) {
-            throw new LibraryPathInvalid($role . '必须位于 /storage/music 目录内。');
-        }
         if ($requiresWrite && !is_writable($resolved)) {
             throw new LibraryPathInvalid('当前服务账户无法写入' . $role . '。');
         }

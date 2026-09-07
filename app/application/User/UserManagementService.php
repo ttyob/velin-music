@@ -336,7 +336,7 @@ final class UserManagementService
             ]);
             $revocation = null;
             if ($status === 'disabled') {
-                // 认证撤销、上传和个人导出取消事实必须与状态同时提交；文件清理由各自 Worker 在事务外完成。
+                // 认证撤销和上传取消事实必须与状态同时提交；文件清理由 Upload Worker 在事务外完成。
                 $revocation = $this->deactivation->deactivateInTransaction([$targetUserId], $now);
             }
             $this->auditLogger->record(
@@ -353,8 +353,6 @@ final class UserManagementService
                     'tokensRevoked' => $revocation['tokensRevoked'] ?? 0,
                     'uploadsCancelled' => $revocation['uploadsCancelled'] ?? 0,
                     'uploadsCancelRequested' => $revocation['uploadsCancelRequested'] ?? 0,
-                    'exportsCancelled' => $revocation['exportsCancelled'] ?? 0,
-                    'exportsCancelRequested' => $revocation['exportsCancelRequested'] ?? 0,
                 ],
             );
             $this->notifications->publishPermissionChange(
@@ -671,9 +669,8 @@ final class UserManagementService
     }
 
     /**
-     * @return array{subsonic:array{configured:bool},scrobble:list<array<string,mixed>>,personalTokens:list<array<string,mixed>>}
-     * 个人令牌只返回名称、范围和时间事实；Scrobble 只返回平台健康状态。摘要、密文、远端用户名/地址、
-     * 撤销内部原因以及一次性明文均不参与查询，管理员不能借运维详情接管用户的第三方身份。
+     * @return array{subsonic:array{configured:bool},personalTokens:list<array<string,mixed>>}
+     * 个人令牌只返回名称、范围和时间事实；外部播放记录连接已退役，管理员详情不再读取第三方凭据或状态。
      */
     private function externalConnectionSummaries(string $userId): array
     {
@@ -702,21 +699,8 @@ final class UserManagementService
         // exists 只判断兼容凭据是否就绪，不把可解密密文装载到 PHP 变量或响应序列化路径。
         $subsonicConfigured = Db::table('users')->where('id', $userId)
             ->whereNotNull('subsonic_secret_ciphertext')->exists();
-        /** @var list<stdClass> $scrobbleRows */
-        $scrobbleRows = Db::table('scrobble_connections')->where('user_id', $userId)
-            ->orderBy('provider')->get([
-                'provider', 'enabled', 'last_success_at', 'last_failure_at', 'last_error_code',
-            ])->all();
-        $scrobble = array_map(static fn (stdClass $row): array => [
-            'provider' => (string) $row->provider,
-            'enabled' => (int) $row->enabled === 1,
-            'lastSuccessAt' => $row->last_success_at === null ? null : (string) $row->last_success_at,
-            'lastFailureAt' => $row->last_failure_at === null ? null : (string) $row->last_failure_at,
-            'lastErrorCode' => $row->last_error_code === null ? null : (string) $row->last_error_code,
-        ], $scrobbleRows);
         return [
             'subsonic' => ['configured' => $subsonicConfigured],
-            'scrobble' => $scrobble,
             'personalTokens' => $tokens,
         ];
     }

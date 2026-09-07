@@ -7,6 +7,7 @@ namespace app\controller\Api\V1\Admin;
 use app\application\Auth\AuthenticationRequired;
 use app\application\Auth\AuthorizationDenied;
 use app\application\Auth\AuthorizationService;
+use app\application\Process\DynamicWorkerSupervisor;
 use app\application\Storage\StorageWriteBlocked;
 use app\application\Upload\UploadAdminService;
 use app\application\Upload\UploadConflict;
@@ -103,6 +104,7 @@ final class UploadController
                 (string) $request->header('idempotency-key', ''),
                 $requestId,
             );
+            $this->startUploadWorker();
             return $this->response(['session' => $session], $requestId, 201);
         } catch (Throwable $throwable) {
             return $this->failure($throwable, $requestId, 'Admin upload session create failed.');
@@ -146,6 +148,7 @@ final class UploadController
             $version = $payload['expectedVersion'] ?? null;
             if (!is_int($version) || $version < 1) throw new UploadInvalid('上传会话版本无效。');
             $session = (new UploadSessionService())->queuePublish($actor, $sessionId, $version, $requestId);
+            $this->startUploadWorker();
             return $this->response(['session' => $session], $requestId);
         } catch (Throwable $throwable) {
             return $this->failure($throwable, $requestId, 'Admin upload publish failed.');
@@ -222,6 +225,23 @@ final class UploadController
             'data' => $data,
             'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')],
         ], $status, $requestId)->withHeader('Cache-Control', 'private, no-store');
+    }
+
+    /**
+     * 在上传事务已经提交后幂等拉起长期消费者。
+     *
+     * Worker 启动失败不能让已创建的会话回滚或变成 HTTP 错误；上传状态和后续触发仍会保留，监督器会在
+     * 下一次上传请求重试。日志只记录固定 Worker 名称和异常类型，不输出会话、文件名、路径或密钥。
+     */
+    private function startUploadWorker(): void
+    {
+        try {
+            (new DynamicWorkerSupervisor())->ensureStarted('upload');
+        } catch (Throwable $throwable) {
+            Log::warning('Dynamic upload worker start failed.', [
+                'worker' => 'velin-upload', 'exception_class' => $throwable::class,
+            ]);
+        }
     }
 
     /**

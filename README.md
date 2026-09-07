@@ -1,4 +1,4 @@
-# Velin Music 0.1.26
+# Velin Music 0.1.27
 
 <p align="center">
   <strong>自托管音乐库、播放器与媒体服务</strong><br>
@@ -17,9 +17,11 @@ Velin Music 是面向个人、家庭和小型团队的自托管音乐服务。�
 Web 播放器、歌词与封面、收藏和播放列表，并通过管理后台完成曲库扫描、任务、插件和系统设置。
 原始音频不会因为刮削或整理而被移动或改名。
 
-公开仓库是由私有源码仓库导出的可运行 backend 构建版本，包含 PHP 应用、数据库迁移、前端静态文件和
-已在 Alpine 中验证的 `linux/amd64` Helper；不包含私有源码、用户数据、媒体文件或凭据。公开插件包单独
-发布到 [Velin Music 插件库](https://github.com/ttyob/velin-music-plugins)，不附在 backend Release 中。
+本仓库定位为 Velin Music 的公开 backend 发布与部署仓库，由私有源码仓库导出可运行构建版本，包含
+脱敏 PHP backend 源码、数据库迁移、前端静态文件和已在 Alpine 中验证的 `linux/amd64` Helper；不包含
+私有前端与 Go 源码、用户数据、媒体文件或凭据。独立的
+[Velin Music 插件库](https://github.com/ttyob/velin-music-plugins) 提供插件索引和历史版本；公开仓库也
+保留构建当前 backend 镜像所需的已审查插件归档，但精简部署包不重复携带它们。
 
 ## 功能
 
@@ -67,23 +69,48 @@ Go 网关只负责高并发的静态和媒体读取；Webman 负责认证、授�
 - `linux/amd64`（当前公开镜像只发布此架构）
 - 至少一个用于保存音乐的磁盘目录；生产环境建议使用 SSD 保存 `docker-data`
 
-### 使用 Release 部署包（推荐）
+### Git clone 直接部署
 
-部署包已经固定 backend 镜像的 SHA-256 digest，并带有 Compose、初始化脚本和校验清单。不要直接把本仓库
-当作生产 Compose 的构建上下文。
+公开稳定标签已经包含默认 `compose.yaml` 和空持久目录。Compose 只拉取已构建镜像，不会在部署主机
+执行 Composer、npm 或 Go 构建；首次启动由 backend 容器原子生成密钥。
 
 ```bash
-VERSION=0.1.26
+git clone https://github.com/ttyob/velin-music.git
+cd velin-music
+docker compose up -d --wait
+docker compose ps
+```
+
+若默认镜像仓库在当前网络不可达，可在部署根新建 `.env`，只覆盖经发布方验证的镜像地址后再启动：
+
+```dotenv
+VELIN_BACKEND_IMAGE=<受信仓库>/velin-music@sha256:<摘要>
+VELIN_REDIS_IMAGE=<受信仓库>/redis@sha256:<摘要>
+VELIN_OWNTONE_IMAGE=<受信仓库>/owntone@sha256:<摘要>
+```
+
+覆盖地址必须来自可信仓库并与发布方公布的摘要一致；不要使用来源和缓存内容无法审计的公共加速地址。
+正式稳定版将同时公布国内可访问的镜像地址与校验信息。
+
+公开 `main` 始终对应最近一次稳定导出。需要精确复现版本时使用
+`git clone --branch v0.1.27 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
+镜像标签均禁止覆盖。
+
+### 使用 Release 精简部署包
+
+Release 部署包只包含 Compose、初始化脚本和空持久目录，其中 `compose.yaml` 固定到本次 backend 镜像
+digest。源码无需重复打包，可直接使用公开仓库或 GitHub 自动生成的 Source code 附件。
+
+```bash
+VERSION=0.1.27
 curl -fL -o "velin-music-deploy-${VERSION}.tar.gz" \
   "https://github.com/ttyob/velin-music/releases/download/v${VERSION}/velin-music-deploy-${VERSION}.tar.gz"
 tar -xzf "velin-music-deploy-${VERSION}.tar.gz"
 cd "velin-music-deploy-${VERSION}"
 
-# 可选但推荐：确认部署包未被篡改
+# 可选但推荐：确认部署配置未被篡改
 sha256sum -c CONTENTS.sha256
 
-cp .env.docker.example .env
-docker compose pull
 docker compose up -d --wait
 docker compose ps
 ```
@@ -111,8 +138,7 @@ docker compose ps
 docker compose ps
 docker compose logs -f --tail=200 backend
 
-# 升级到新的 Release：替换为新部署包后执行
-docker compose pull
+# 升级到新的稳定标签或 Release 部署包后执行
 docker compose up -d --wait
 
 # 停止服务（保留数据）
@@ -120,7 +146,7 @@ docker compose stop
 ```
 
 升级前请保留 `docker-data/database/` 的备份。不要执行 `docker compose down -v`，否则会删除 Redis 持久化
-卷。部署包中的自动升级流程会在迁移前创建 SQLite 冷备份，健康检查失败时恢复旧环境。
+卷。部署包配套的自动升级流程会在迁移前创建 SQLite 冷备份，健康检查失败时恢复旧环境。
 
 ## 插件
 
@@ -137,14 +163,16 @@ docker compose stop
 
 每个稳定 `vX.Y.Z` Release 通常包含：
 
-- `velin-music-deploy-X.Y.Z.tar.gz`：只含运行配置的 Docker Compose 部署包
+- `velin-music-deploy-X.Y.Z.tar.gz`：digest 固定的精简 Docker Compose 部署包
 - `SHA256SUMS` 与部署包内的 `CONTENTS.sha256`：文件完整性校验
+- GitHub 自动生成的 Source code ZIP/TAR：与稳定标签一致的完整公开 backend 源码
 - GHCR 中的 `linux/amd64` 镜像、SBOM、构建证明和签名
 
-公开插件归档和 `index.json` 位于独立的 [Velin Music 插件库](https://github.com/ttyob/velin-music-plugins)，
-backend Release 不重复附带插件 ZIP。
+公开插件归档和 `index.json` 位于独立的
+[Velin Music 插件库](https://github.com/ttyob/velin-music-plugins)，Velin Music Release 不重复附加插件 ZIP。
 
-镜像标签用于阅读和发现版本，生产环境应优先使用部署包写入的 digest。发布流程不会覆盖已经存在的版本标签。
+Git 标签部署使用同版本不可变镜像标签；Release 精简部署包固定镜像 digest，适合要求供应链精确复现的
+生产环境。发布流程不会覆盖已经存在的版本标签或附件。
 
 ## 限制与安全提示
 

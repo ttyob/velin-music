@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace app\application\Admin;
 
 use app\application\Auth\AuthorizationDenied;
-use app\application\System\SqliteBackupStatusService;
 use app\application\System\SystemLimitSettingsService;
 use stdClass;
 use support\Db;
@@ -15,9 +14,8 @@ use Throwable;
  * 构建按 capability 与音乐库管理范围裁剪的后台状态快照（ADMIN-DASH-001）。
  *
  * 可选模块仅在权威 Session 投影包含对应能力时出现，音乐库与扫描查询还会和操作者当前 manage 级库 ID
- * 求交集。系统管理员的备份模块只读取固定目录汇总；响应始终只使用逻辑名称、匿名计数和稳定原因码，
- * 物理路径、邮箱、播放曲目、秘密、文件名、摘要与原始错误均不得跨越此边界。本服务只读且不承担任务
- * 创建、文件维护、备份或恢复职责。
+ * 求交集。响应始终只使用逻辑名称、匿名计数和稳定原因码，物理路径、邮箱、播放曲目、秘密、文件名、
+ * 摘要与原始错误均不得跨越此边界。本服务只读且不承担任务创建、文件维护或部署级备份职责。
  */
 final class AdminOverviewService
 {
@@ -26,16 +24,6 @@ final class AdminOverviewService
         'manage_users', 'manage_library', 'manage_storage', 'manage_system',
         'view_audit', 'run_scrape', 'edit_metadata', 'view_play_privacy',
     ];
-
-    /**
-     * 注入只读备份探针以隔离文件系统测试；生产默认在真正需要该模块时才按数据库配置创建探针。
-     *
-     * 延迟创建保证不具备 manage_system 的操作者不会访问数据库备份目录。依赖只读，不持有请求数据，
-     * 也不提供创建或恢复能力。
-     */
-    public function __construct(private readonly ?SqliteBackupStatusService $backupStatus = null)
-    {
-    }
 
     /**
      * 返回独立采样的权限模块，使单个探针失败不会抹去整张概览。
@@ -63,8 +51,6 @@ final class AdminOverviewService
             $modules['accounts'] = $this->module(fn (): array => $this->accounts());
         }
         if (in_array('manage_system', $capabilities, true)) {
-            $modules['backups'] = $this->module(fn (): array =>
-                ($this->backupStatus ?? new SqliteBackupStatusService())->status());
             // The lock-only admission mechanism has no reliable observer for active leases. Returning
             // unknown is deliberate until persistent metrics exist; zero would conceal saturation.
             $modules['transcoding'] = [

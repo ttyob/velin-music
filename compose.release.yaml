@@ -1,12 +1,12 @@
 name: velin-music
 
 x-backend-image: &backend-image
-  # 公开部署包只拉取 CI 已构建并签名的镜像；源码仓库和构建上下文不会进入部署包。
+  # 公开 clone 与精简部署包默认只拉取 CI 已构建并签名的镜像；公开源码仅供审计或复建，不挂入容器。
   image: ${VELIN_BACKEND_IMAGE:-ghcr.io/your-org/velin-music:1.0.0}
 
 services:
   redis:
-    image: redis:7.4-alpine
+    image: ${VELIN_REDIS_IMAGE:-redis:7.4-alpine}
     restart: unless-stopped
     command:
       - redis-server
@@ -35,7 +35,7 @@ services:
     network_mode: host
 
   owntone:
-    image: owntone/owntone:29.3@sha256:6a88589edc4dd9c438da62a18a25374d3e6e01457745f241a22baf88c43c9582
+    image: ${VELIN_OWNTONE_IMAGE:-owntone/owntone:29.3@sha256:6a88589edc4dd9c438da62a18a25374d3e6e01457745f241a22baf88c43c9582}
     restart: unless-stopped
     # AirPlay 发现和时钟同步需要 mDNS/UDP；host 网络与 DLNA 共用，JSON API 对非 localhost 固定拒绝。
     network_mode: host
@@ -79,7 +79,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       # 公开部署与源码部署使用同一两根布局：应用状态统一进入 /data，音乐、下载和回收站进入 /storage。
-      # 两个宿主根由部署包预置，缺失时必须失败，不能静默生成空库或空音乐目录。
+      # 两个宿主根由公开 clone 或精简部署包预置，缺失时必须失败，不能静默生成空库或空音乐目录。
       - type: bind
         source: ./docker-data
         target: /data

@@ -16,7 +16,7 @@ use support\Request;
 use support\Response;
 use Throwable;
 
-/** 提供独立隐私能力保护的在线播放、指定账号历史和导出任务只读投影。 */
+/** 提供独立隐私能力保护的在线播放和指定账号历史只读投影。 */
 final class PrivacyController
 {
     public function nowPlaying(Request $request): Response
@@ -32,12 +32,6 @@ final class PrivacyController
                 $actor, $userId, self::integer($request->get('limit'), 50, 1, 100),
                 self::integer($request->get('offset'), 0, 0, 10_000),
             ));
-    }
-
-    public function exports(Request $request, string $userId): Response
-    {
-        return $this->run($request, static fn (array $actor): array =>
-            (new AdminPlaybackPrivacyService())->exports($actor, $userId));
     }
 
     /** Controller 先要求隐私能力，领域服务对指定账号入口再强制与 manage_users 组合。 */

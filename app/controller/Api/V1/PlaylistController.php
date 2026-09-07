@@ -15,6 +15,7 @@ use app\application\Playlist\M3uImportService;
 use app\application\Playlist\M3uSourceInvalid;
 use app\application\Playlist\M3uSyncService;
 use app\application\Playlist\PlaylistAutoCompletionService;
+use app\application\Process\DynamicWorkerSupervisor;
 use app\application\Playlist\PlatformPlaylistImportService;
 use app\application\Playlist\PlaylistInvalid;
 use app\application\Playlist\PlaylistImportInvalid;
@@ -376,11 +377,20 @@ final class PlaylistController
             $payload = $request->post();
             $command = (new PlaylistValidator())->manualEntry(is_array($payload) ? $payload : []);
             $playlist = (new PlaylistService())->addManualEntry($actor, $playlistId, $command);
-            (new PlaylistAutoCompletionService())->enqueueMissingForPlaylist(
+            $completionStarted = (new PlaylistAutoCompletionService())->enqueueMissingForPlaylist(
                 $playlistId,
                 (string) $actor['id'],
                 (bool) ($actor['isSuperAdmin'] ?? false),
             );
+            if ($completionStarted) {
+                try {
+                    (new DynamicWorkerSupervisor())->ensureStarted('playlist-completion');
+                } catch (Throwable $workerFailure) {
+                    Log::warning('Dynamic playlist completion worker start failed.', [
+                        'worker' => 'velin-playlist-completion', 'exception_class' => $workerFailure::class,
+                    ]);
+                }
+            }
 
             return $this->playlistResponse($playlist, $requestId);
         } catch (Throwable $throwable) {

@@ -1,12 +1,11 @@
 #!/bin/sh
 set -eu
 
-# 生成公开 Docker 部署包。
+# 生成公开 Docker 精简部署包。
 #
-# 该脚本只能从当前私有源码树读取已经审查过的部署入口：生产 Compose 只引用 CI 构建的镜像，
-# 不在输出包中复制 PHP/前端/Go 源码、测试、vendor、数据库、媒体或运行时数据。输出目录必须
-# 不存在，避免把已发布包和新版本混合；镜像必须使用 CI 返回的 sha256 digest，防止同名标签漂移。
-# 脚本同时支持私有源码根和自动导出的公开 backend 根，两种输入必须生成完全相同的部署布局。
+# 该脚本只从当前私有源码树或导出的公开 backend 树读取已经审查过的部署入口。输出只包含运行配置、
+# 初始化脚本和空持久目录，不重复打包 Git 标签已经提供的公开源码；镜像必须使用 CI 返回的 sha256
+# digest，防止同名标签漂移。输出目录必须不存在，避免把既有附件、运行数据或密钥混入新版本。
 
 usage()
 {
@@ -59,7 +58,7 @@ mkdir -p "$OUTPUT/bin" "$OUTPUT/docker/owntone" \
     "$OUTPUT/docker-data/runtime" "$OUTPUT/docker-data/plugins" "$OUTPUT/docker-data/cache" \
     "$OUTPUT/storage/music" "$OUTPUT/storage/downloads"
 
-# Compose 中的占位镜像只在这里替换；输出包不会携带构建上下文或私有注册表凭据。
+# Compose 中的镜像占位值只在这里替换；部署包不携带源码、构建上下文或仓库凭据。
 sed "s#ghcr.io/your-org/velin-music:1.0.0#$IMAGE#g" \
     "$BACKEND_ROOT/compose.release.yaml" > "$OUTPUT/compose.yaml"
 sed "s#^VELIN_BACKEND_IMAGE=.*#VELIN_BACKEND_IMAGE=$IMAGE#" \
@@ -70,7 +69,7 @@ cp -- "$BACKEND_ROOT/bin/docker-bootstrap" "$OUTPUT/bin/docker-bootstrap"
 cp -- "$BACKEND_ROOT/docker/owntone/owntone.conf" "$OUTPUT/docker/owntone/owntone.conf"
 cp -- "$DATABASE_GITIGNORE" "$OUTPUT/docker-data/database/.gitignore"
 
-# 这些占位文件只保证数据库 bind source 在全新解压目录中存在；业务数据仍必须由部署者创建或恢复。
+# 占位文件只保证两个 bind source 在解压后存在；容器首次启动负责建立受管子目录和生产密钥。
 : > "$OUTPUT/docker-data/config/.gitkeep"
 : > "$OUTPUT/docker-data/runtime/.gitkeep"
 : > "$OUTPUT/docker-data/plugins/.gitkeep"
@@ -84,8 +83,7 @@ chmod 0644 "$OUTPUT/compose.yaml" "$OUTPUT/.env.docker.example" "$OUTPUT/README.
     "$OUTPUT/docker-data/plugins/.gitkeep" "$OUTPUT/docker-data/cache/.gitkeep" \
     "$OUTPUT/storage/music/.gitkeep" "$OUTPUT/storage/downloads/.gitkeep"
 
-# 清单覆盖隐藏配置模板和所有空目录占位文件；部署者解压后可先验证清单，再复制生成自己的 `.env`。
-# 清单本身不包含在自身摘要中，重复生成同一输入时内容保持稳定。
+# 清单覆盖隐藏配置模板和所有空目录占位文件；清单本身不包含在自身摘要中。
 (
     cd "$OUTPUT"
     find . -type f -not -path './CONTENTS.sha256' -print0 | sort -z | xargs -0 sha256sum > CONTENTS.sha256

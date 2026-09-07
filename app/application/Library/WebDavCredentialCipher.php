@@ -9,8 +9,8 @@ use RuntimeException;
 /**
  * 使用用途隔离的 Sodium secretbox 保存 WebDAV 密码。
  *
- * 根密钥来自部署级 `VELIN_CREDENTIAL_KEY`，再经 HKDF 派生 WebDAV 专用子密钥，不能与 Subsonic 或
- * Scrobble 密文互换。明文只允许在管理请求校验和单次 WebDAV 调用内存中存在；不得写日志、审计、
+ * 根密钥来自部署级 `VELIN_CREDENTIAL_KEY`，再经 HKDF 派生 WebDAV 专用子密钥，不能与 Subsonic
+ * 密文互换。明文只允许在管理请求校验和单次 WebDAV 调用内存中存在；不得写日志、审计、
  * 任务、缓存文件名或 API 响应。密文被篡改、密钥轮换或格式未知时统一失败关闭。
  */
 final readonly class WebDavCredentialCipher

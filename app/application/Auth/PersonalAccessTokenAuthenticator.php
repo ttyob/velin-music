@@ -76,6 +76,7 @@ final readonly class PersonalAccessTokenAuthenticator
             'displayName' => (string) $row->display_name,
             'email' => $row->email === null ? null : (string) $row->email,
             'isSuperAdmin' => $isSuper,
+            'librarySetupRequired' => !(new \app\application\Library\DefaultLibraryService())->isConfigured(),
             'permissionVersion' => (int) $row->permission_version,
             'capabilities' => $effective,
             'libraries' => $this->libraries->resolve($userId, $isSuper),

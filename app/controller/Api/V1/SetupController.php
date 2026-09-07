@@ -6,6 +6,7 @@ namespace app\controller\Api\V1;
 
 use app\application\Auth\SessionService;
 use app\application\Auth\SetupAlreadyCompleted;
+use app\application\Auth\SetupLibraryValidator;
 use app\application\Auth\SetupService;
 use app\application\Auth\SetupValidator;
 use app\http\CsrfTokenManager;
@@ -124,6 +125,49 @@ final class SetupController
                 500,
                 $requestId,
             );
+        }
+    }
+
+    /**
+     * 返回登录后首次配置默认音乐库所需的 CSRF 令牌。
+     * 该入口不开放给匿名用户或普通账号，且已配置默认库后永久关闭。
+     */
+    public function libraryShow(Request $request): Response
+    {
+        $requestId = RequestContext::requestId();
+        $actor = (new \app\application\Auth\SessionService())->currentUser($request);
+        if ($actor === null) return JsonResponseFactory::error('AUTHENTICATION_REQUIRED', '请先登录。', 401, $requestId);
+        if (($actor['isSuperAdmin'] ?? false) !== true) return JsonResponseFactory::error('PERMISSION_DENIED', '只有管理员可以完成首次设置。', 403, $requestId);
+        if (!(new \app\application\Library\DefaultLibraryService())->isConfigured()) {
+            return JsonResponseFactory::create([
+                'data' => ['required' => true, 'csrfToken' => (new CsrfTokenManager())->getOrCreate($request->session()), 'defaultRootPath' => '/storage/music'],
+                'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')],
+            ], 200, $requestId);
+        }
+        return JsonResponseFactory::error('NOT_FOUND', '请求的资源不存在。', 404, $requestId);
+    }
+
+    /** 登录后的超级管理员提交默认音乐库目录；配置成功后才允许访问普通业务 API。 */
+    public function configureLibrary(Request $request): Response
+    {
+        $requestId = RequestContext::requestId();
+        $actor = (new \app\application\Auth\SessionService())->currentUser($request);
+        if ($actor === null) return JsonResponseFactory::error('AUTHENTICATION_REQUIRED', '请先登录。', 401, $requestId);
+        if (($actor['isSuperAdmin'] ?? false) !== true) return JsonResponseFactory::error('PERMISSION_DENIED', '只有管理员可以完成首次设置。', 403, $requestId);
+        $payload = $request->post();
+        $validation = (new SetupLibraryValidator())->validate(is_array($payload) ? $payload : []);
+        if (!$validation->isValid() || $validation->input === null) {
+            return JsonResponseFactory::error('VALIDATION_FAILED', '请检查音乐库目录。', 422, $requestId, ['fields' => $validation->errors]);
+        }
+        try {
+            (new SetupService())->configureDefaultLibrary($validation->input, $actor, $requestId);
+            $user = (new \app\application\Auth\SessionService())->currentUser($request);
+            return JsonResponseFactory::create(['data' => ['configured' => true, 'user' => $user], 'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')]], 201, $requestId);
+        } catch (SetupAlreadyCompleted) {
+            return JsonResponseFactory::error('NOT_FOUND', '请求的资源不存在。', 404, $requestId);
+        } catch (Throwable $throwable) {
+            Log::error('Default library setup failed.', ['request_id' => $requestId, 'exception_class' => $throwable::class]);
+            return JsonResponseFactory::error('SETUP_LIBRARY_FAILED', '默认音乐库未配置，请检查目录后重试。', 422, $requestId);
         }
     }
 }

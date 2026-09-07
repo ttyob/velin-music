@@ -18,7 +18,8 @@ use app\application\Metadata\MetadataPolicyReprojectionService;
 use app\application\Metadata\MetadataPolicyReprojectionBusy;
 use app\application\Metadata\MetadataScrapePolicyConflict;
 use app\application\Metadata\MetadataScrapePolicyUnavailable;
-use app\application\System\SqliteBackupService;
+use app\process\PlaylistAutoCompletionWorker;
+use app\process\UploadWorker;
 use InvalidArgumentException;
 use stdClass;
 use support\Db;
@@ -43,7 +44,6 @@ final class CliApplication
                 'help' => $this->help(),
                 'database:check' => $this->databaseCheck(),
                 'system:status' => $this->systemStatus(),
-                'backup:create' => $this->createBackup($parsed['options']),
                 'plugin:initialize-defaults' => $this->initializeDefaultPlugins($parsed['options']),
                 'plugin:finalize-pending' => $this->finalizePendingPlugins($parsed['options']),
                 'scan:create' => $this->createScan($parsed['options']),
@@ -58,6 +58,7 @@ final class CliApplication
                 'dlna:seek' => $this->dlnaControl('seek', $parsed['options']),
                 'dlna:volume' => $this->dlnaControl('volume', $parsed['options']),
                 'dlna:status' => $this->dlnaControl('status', $parsed['options']),
+                'worker:run' => $this->runWorker($parsed['options']),
                 default => throw new InvalidArgumentException('未知管理命令。'),
             };
             $this->output($result, ($parsed['options']['json'] ?? false) === true);
@@ -83,7 +84,6 @@ final class CliApplication
         return ['commands' => [
             'database:check [--json]',
             'system:status [--json]',
-            'backup:create --actor=USERNAME --confirm=CREATE_DATABASE_BACKUP [--json]',
             'plugin:initialize-defaults [--json]',
             'plugin:finalize-pending [--json]',
             'scan:create --actor=USERNAME --library=ULID --type=incremental|full --confirm=QUEUE_SCAN [--json]',
@@ -95,7 +95,46 @@ final class CliApplication
             'dlna:pause|resume|stop|status --actor=USERNAME --device=UUID [--json]',
             'dlna:seek --actor=USERNAME --device=UUID --position-ms=N [--json]',
             'dlna:volume --actor=USERNAME --device=UUID --volume=0..100 [--json]',
+            'worker:run --worker=upload|playlist-completion',
         ]];
+    }
+
+    /**
+     * 运行一个按需启动的长期任务循环。
+     *
+     * 该命令只允许内部监督器使用，worker 类型是固定白名单；它不接受路径、SQL 或外部命令参数。循环
+     * 复用正式 Worker 的 tick 方法，因此上传和歌单补全仍保持同一租约、重试、幂等和错误码语义。父 HTTP
+     * Worker 退出后子进程会主动结束，SIGTERM/SIGINT 只在当前 tick 完成后退出，避免半个文件发布或事务
+     * 在信号中间被截断。此方法正常情况下不会返回，直到收到停止信号或父进程消失。
+     *
+     * @param array<string,string|bool> $options
+     * @return array<string,bool> 仅用于满足 CLI 调度器的统一输出契约
+     */
+    private function runWorker(array $options): array
+    {
+        $this->allowedOptions($options, ['worker']);
+        $workerName = $options['worker'] ?? null;
+        if (!is_string($workerName) || !in_array($workerName, ['upload', 'playlist-completion'], true)) {
+            throw new InvalidArgumentException('长期 Worker 类型无效。');
+        }
+        if (function_exists('cli_set_process_title')) {
+            @cli_set_process_title('velin-' . $workerName);
+        }
+        $worker = $workerName === 'upload' ? new UploadWorker() : new PlaylistAutoCompletionWorker();
+        $parentPid = function_exists('posix_getppid') ? posix_getppid() : 0;
+        $stopping = false;
+        if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGTERM, static function () use (&$stopping): void { $stopping = true; });
+            pcntl_signal(SIGINT, static function () use (&$stopping): void { $stopping = true; });
+        }
+        while (!$stopping) {
+            if ($parentPid > 1 && function_exists('posix_getppid') && posix_getppid() !== $parentPid) break;
+            $worker->tick();
+            // 任务服务自身按状态控制实际工作量；一秒节拍避免空闲时频繁唤醒并保留快速启动响应。
+            usleep(1_000_000);
+        }
+        return ['stopped' => true];
     }
 
     /**
@@ -136,22 +175,6 @@ final class CliApplication
                 'metadataBatches' => Db::connection()->getSchemaBuilder()->hasTable('metadata_batch_plans')
                     ? Db::table('metadata_batch_plans')->whereIn('status', ['queued', 'running'])->count() : 0,
             ]];
-    }
-
-    /**
-     * 为现有活动管理员创建在线一致的 SQLite 备份。
-     *
-     * 命令要求 `manage_system` 和不可缩写确认词，不接受路径或文件名。服务仅返回不透明备份 ID、大小和
-     * 创建时间；快照完整性校验及原子发布完成后才写审计，失败不会覆盖上一份有效备份。
-     */
-    private function createBackup(array $options): array
-    {
-        $this->allowedOptions($options, ['actor', 'confirm', 'json']);
-        if (($options['confirm'] ?? null) !== 'CREATE_DATABASE_BACKUP') {
-            throw new InvalidArgumentException('数据库备份确认词必须是 CREATE_DATABASE_BACKUP。');
-        }
-        $actor = $this->actor($this->required($options, 'actor'), 'manage_system');
-        return (new SqliteBackupService())->createManual((string) $actor['id'], $this->requestId());
     }
 
     /**

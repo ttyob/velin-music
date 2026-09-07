@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace app\application\Auth;
 
+use app\application\Library\DefaultLibraryService;
+use app\application\Library\LibraryPathInspector;
+use app\application\Storage\StorageLayout;
 use app\application\Subsonic\SubsonicCredentialCipher;
 use JsonException;
 use PDO;
@@ -23,6 +26,7 @@ final class SetupService
 {
     public function __construct(
         private readonly SubsonicCredentialCipher $subsonicCredentials = new SubsonicCredentialCipher(),
+        private readonly LibraryPathInspector $libraryPaths = new LibraryPathInspector(),
     ) {
     }
 
@@ -81,6 +85,117 @@ final class SetupService
         }
 
         return $userId;
+    }
+
+    /**
+     * 由已登录超级管理员完成首次默认音乐库配置。
+     *
+     * 前置条件是首个管理员已经存在且当前没有有效默认库；路径在写事务前后均解析并检查缓存隔离，
+     * 随后与库记录、管理员 manage 授权、默认库指针和审计在同一短事务提交。任一步失败都会回滚，
+     * 不创建目录、不移动媒体，也不会把普通账号升级为管理员。
+     *
+     * @param array<string,mixed> $actor 当前认证主体
+     * @return string 动态生成的音乐库 ULID
+     */
+    public function configureDefaultLibrary(SetupLibraryInput $input, array $actor, string $requestId): string
+    {
+        if (($actor['isSuperAdmin'] ?? false) !== true || !is_string($actor['id'] ?? null)) {
+            throw new \RuntimeException('Only a super administrator may configure the default library.');
+        }
+        $resolvedRoot = $this->resolveSetupLibraryRoot($input->rootPath);
+        $libraryId = (string) new Ulid();
+        $now = gmdate('Y-m-d\TH:i:s\Z');
+        $pdo = Db::connection()->getPdo();
+        $transactionOpen = false;
+        $pdo->exec('BEGIN IMMEDIATE');
+        $transactionOpen = true;
+        try {
+            if ((new DefaultLibraryService())->id() !== null) {
+                throw new SetupAlreadyCompleted('Default library is already configured.');
+            }
+            $this->assertSetupLibraryAvailable($pdo, $resolvedRoot);
+            Db::table('music_libraries')->insert([
+                'id' => $libraryId,
+                'name' => '默认音乐库',
+                'inbox_path' => null,
+                'resolved_inbox_path' => null,
+                'root_path' => $input->rootPath,
+                'resolved_root_path' => $resolvedRoot,
+                'scrape_storage_mode' => 'managed_cache',
+                'source_type' => 'local',
+                'remote_metadata_mode' => 'filename_only',
+                'proxy_profile_id' => null,
+                'status' => 'active',
+                'symlink_policy' => 'ignore',
+                'default_locale' => 'zh-CN',
+                'scan_mode' => 'manual',
+                'scan_status' => 'never_scanned',
+                'artist_count' => 0,
+                'album_count' => 0,
+                'song_count' => 0,
+                'last_scanned_at' => null,
+                'version' => 1,
+                'created_by' => (string) $actor['id'],
+                'updated_by' => (string) $actor['id'],
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+            Db::table('library_user_grants')->insert([
+                'library_id' => $libraryId,
+                'user_id' => (string) $actor['id'],
+                'access_level' => 'manage',
+                'granted_by' => (string) $actor['id'],
+                'granted_at' => $now,
+            ]);
+            Db::table('system_settings')->insert([
+                'setting_key' => DefaultLibraryService::SETTING_KEY,
+                'value_json' => json_encode($libraryId, JSON_THROW_ON_ERROR),
+                'version' => 1,
+                'updated_by' => (string) $actor['id'],
+                'updated_at' => $now,
+            ]);
+            $this->insertLibrarySetupAudit($pdo, (string) $actor['id'], $libraryId, $requestId, $now);
+            $pdo->exec('COMMIT');
+            $transactionOpen = false;
+        } catch (Throwable $throwable) {
+            if ($transactionOpen) $pdo->exec('ROLLBACK');
+            throw $throwable;
+        }
+        return $libraryId;
+    }
+
+    private function resolveSetupLibraryRoot(string $rootPath): string
+    {
+        $resolved = $this->libraryPaths->resolveMediaDirectory($rootPath, '音乐库目录', false);
+        $cache = realpath(StorageLayout::SCRAPE_CACHE_ROOT);
+        if ($cache !== false && $this->libraryPaths->overlaps($resolved, $cache)) {
+            throw new \RuntimeException('音乐库目录不能与刮削缓存目录重叠。');
+        }
+        return $resolved;
+    }
+
+    private function assertSetupLibraryAvailable(PDO $pdo, string $resolvedRoot): void
+    {
+        $statement = $pdo->query("SELECT resolved_root_path, resolved_inbox_path FROM music_libraries WHERE source_type = 'local'");
+        foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            foreach ([(string) ($row['resolved_root_path'] ?? ''), (string) ($row['resolved_inbox_path'] ?? '')] as $path) {
+                if ($path !== '' && $this->libraryPaths->overlaps($resolvedRoot, $path)) {
+                    throw new \RuntimeException('音乐库目录与已有配置重叠。');
+                }
+            }
+        }
+    }
+
+    private function insertLibrarySetupAudit(PDO $pdo, string $userId, string $libraryId, string $requestId, string $now): void
+    {
+        $statement = $pdo->prepare(<<<'SQL'
+INSERT INTO audit_logs (id, actor_user_id, action, object_type, object_id, result, request_id, metadata_json, created_at)
+VALUES (:id, :actor, 'system.library_setup', 'music_library', :object_id, 'success', :request_id, '{}', :created_at)
+SQL);
+        $statement->execute([
+            'id' => (string) new Ulid(), 'actor' => $userId, 'object_id' => $libraryId,
+            'request_id' => $requestId, 'created_at' => $now,
+        ]);
     }
 
     /**

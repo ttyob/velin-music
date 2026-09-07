@@ -14,7 +14,6 @@ use app\controller\Api\V1\AccountController;
 use app\controller\Api\V1\BookmarkController;
 use app\controller\Api\V1\MeController;
 use app\controller\Api\V1\PersonalAccessTokenController;
-use app\controller\Api\V1\PersonalDataExportController;
 use app\controller\Api\V1\RealtimeController;
 use app\controller\Api\V1\SetupController;
 use app\controller\Api\V1\MediaController;
@@ -35,7 +34,6 @@ use app\controller\Api\V1\Admin\AdminPlaylistController;
 use app\controller\Api\V1\SmartPlaylistController;
 use app\controller\Api\V1\RadioController;
 use app\controller\Api\V1\SearchController;
-use app\controller\Api\V1\ScrobbleConnectionController;
 use app\controller\Api\V1\StreamController;
 use app\controller\Api\V1\AvatarController;
 use app\controller\Api\V1\ThemeController;
@@ -81,7 +79,11 @@ Route::get('/api/v1/themes', [ThemeController::class, 'index']);
 Route::get('/api/v1/setup', [SetupController::class, 'show']);
 Route::post('/api/v1/setup', [SetupController::class, 'create'])
     ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/setup/library', [SetupController::class, 'libraryShow']);
+Route::post('/api/v1/setup/library', [SetupController::class, 'configureLibrary'])
+    ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/auth/csrf', [AuthController::class, 'csrf']);
+Route::get('/api/v1/auth/captcha', [AuthController::class, 'captcha']);
 Route::get('/api/v1/app/capabilities', [AppCapabilityController::class, 'show']);
 Route::post('/api/v1/app/negotiate', [AppCapabilityController::class, 'negotiate'])
     ->middleware(VerifyCsrfToken::class);
@@ -112,17 +114,6 @@ Route::post('/api/v1/tokens', [PersonalAccessTokenController::class, 'create'])
     ->middleware(VerifyCsrfToken::class);
 Route::delete('/api/v1/tokens/{tokenId}', [PersonalAccessTokenController::class, 'revoke'])
     ->middleware(VerifyCsrfToken::class);
-Route::get('/api/v1/me/scrobble-connections', [ScrobbleConnectionController::class, 'index']);
-Route::put('/api/v1/me/scrobble-connections/{provider}', [ScrobbleConnectionController::class, 'save'])
-    ->middleware(VerifyCsrfToken::class);
-Route::delete('/api/v1/me/scrobble-connections/{provider}', [ScrobbleConnectionController::class, 'delete'])
-    ->middleware(VerifyCsrfToken::class);
-Route::get('/api/v1/me/exports', [PersonalDataExportController::class, 'index']);
-Route::post('/api/v1/me/exports', [PersonalDataExportController::class, 'create'])
-    ->middleware(VerifyCsrfToken::class);
-Route::post('/api/v1/me/exports/{jobId}/cancel', [PersonalDataExportController::class, 'cancel'])
-    ->middleware(VerifyCsrfToken::class);
-Route::get('/api/v1/me/exports/{jobId}/download', [PersonalDataExportController::class, 'download']);
 Route::get('/api/v1/events', [RealtimeController::class, 'stream']);
 Route::patch('/api/v1/me/preferences', [MeController::class, 'updatePreferences'])
     ->middleware(VerifyCsrfToken::class);
@@ -287,7 +278,6 @@ Route::patch('/api/v1/admin/system-errors/{errorId}', [SystemErrorController::cl
 Route::get('/api/v1/admin/overview', [OverviewController::class, 'show']);
 Route::get('/api/v1/admin/privacy/now-playing', [PrivacyController::class, 'nowPlaying']);
 Route::get('/api/v1/admin/privacy/users/{userId}/history', [PrivacyController::class, 'history']);
-Route::get('/api/v1/admin/privacy/users/{userId}/exports', [PrivacyController::class, 'exports']);
 Route::post('/api/v1/admin/users', [UserController::class, 'create'])
     ->middleware(VerifyCsrfToken::class);
 Route::post('/api/v1/admin/users/bulk-preview', [UserController::class, 'bulkPreview'])
@@ -572,6 +562,9 @@ Route::put('/api/v1/admin/system-settings/basic', [SystemSettingsController::cla
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/system-settings/limits', [SystemSettingsController::class, 'showLimits']);
 Route::put('/api/v1/admin/system-settings/limits', [SystemSettingsController::class, 'updateLimits'])
+    ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/system-settings/dlna', [SystemSettingsController::class, 'showDlna']);
+Route::put('/api/v1/admin/system-settings/dlna', [SystemSettingsController::class, 'updateDlna'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/system-settings/proxy', [SystemSettingsController::class, 'showProxy']);
 Route::put('/api/v1/admin/system-settings/proxy', [SystemSettingsController::class, 'updateProxy'])

@@ -7,6 +7,7 @@ namespace app\controller\Api\V1;
 use app\application\Auth\AuthenticationRequired;
 use app\application\Auth\AuthorizationService;
 use app\application\System\PublicUrlConfig;
+use app\application\System\DlnaSettingsService;
 use app\http\JsonResponseFactory;
 use app\http\RequestContext;
 use support\Log;
@@ -27,6 +28,7 @@ final class AppCapabilityController
     {
         $requestId = RequestContext::requestId();
         $external = self::externalTicketAvailable();
+        $serverDlna = self::serverManagedDlnaAvailable();
         return JsonResponseFactory::create(['data' => [
             'product' => 'Velin Music',
             'apiVersion' => 'v1',
@@ -38,7 +40,7 @@ final class AppCapabilityController
                 'catalog' => true, 'search' => true, 'queue' => true, 'favorites' => true,
                 'playlists' => true, 'bookmarks' => true, 'lyrics' => true, 'offlineManifest' => true,
                 'realtimeSse' => true, 'playbackExternalTicket' => $external,
-                'serverManagedDlna' => true, 'serverManagedAirplay' => true,
+                'serverManagedDlna' => $serverDlna, 'serverManagedAirplay' => true,
             ],
             'outputScopes' => ['onDevice', 'nearbyNetwork', 'serverManaged'],
             'externalProtocols' => $external ? ['dlna', 'google_cast'] : [],
@@ -106,6 +108,16 @@ final class AppCapabilityController
         try {
             return PublicUrlConfig::externalPlaybackOrigin() !== null;
         } catch (\InvalidArgumentException) {
+            return false;
+        }
+    }
+
+    /** 只在版本化全局设置明确开启且配置可读时声明服务端 DLNA；缺失/损坏状态失败关闭。 */
+    public static function serverManagedDlnaAvailable(): bool
+    {
+        try {
+            return (new DlnaSettingsService())->get()['enabled'] === true;
+        } catch (\Throwable) {
             return false;
         }
     }

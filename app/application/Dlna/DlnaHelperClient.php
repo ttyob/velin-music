@@ -21,6 +21,7 @@ final readonly class DlnaHelperClient
     public function __construct(
         private ?string $binaryPath = null,
         private ?string $socketPath = null,
+        private DlnaHelperSupervisor $supervisor = new DlnaHelperSupervisor(),
     )
     {
     }
@@ -42,6 +43,10 @@ final readonly class DlnaHelperClient
             $input = json_encode($command, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         } catch (JsonException $exception) {
             throw new DlnaUnavailable('DLNA_PROTOCOL_INVALID', 'DLNA 命令无法编码。');
+        }
+        // 生产默认由后台开关提前启动 daemon；请求级 ensure 是崩溃恢复边界，测试注入 binaryPath 时跳过。
+        if ($this->binaryPath === null && $this->socketPath === null) {
+            $this->supervisor->start();
         }
         $socketPayload = $this->invokeSocket($input);
         if ($socketPayload !== null) return $socketPayload;
