@@ -20,10 +20,11 @@ use Throwable;
 /**
  * 管理受信插件商店的源地址、索引协议和服务端安装入口。
  *
- * 源地址是管理员明确配置的 HTTPS 索引，不接受凭据、IP 字面量、私网 DNS 或重定向；索引只能声明同源
- * 相对 ZIP、SemVer、大小和 SHA-256。浏览器只看到脱敏的插件描述，真正下载由本服务在短超时内完成，并
- * 交给与手工上传相同的 ZIP 校验、版本 CAS、数据库生命周期和回滚流程。索引不写入业务数据库，远端
- * 短暂不可用时不会改变已安装插件或旧配置。
+ * 源地址是管理员明确配置的 HTTPS 索引，也可使用规范 GitHub 仓库首页并转换到该仓库 main 分支的 Raw
+ * 索引；不接受凭据、IP 字面量、私网 DNS 或重定向。索引只能声明同源相对 ZIP、SemVer、大小和 SHA-256。
+ * 浏览器只看到脱敏的插件描述，真正下载由本服务在短超时内完成，并交给与手工上传相同的 ZIP 校验、
+ * 版本 CAS、数据库生命周期和回滚流程。索引不写入业务数据库，远端短暂不可用时不会改变已安装插件
+ * 或旧配置。
  */
 final readonly class PluginStoreService
 {
@@ -313,11 +314,30 @@ final readonly class PluginStoreService
         return array_values(array_unique($addresses));
     }
 
+    /**
+     * 将管理员源配置收敛为可直接读取索引的 HTTPS URL。
+     *
+     * 官方文档公开的是便于人工访问的 GitHub 仓库首页，而 HTTP 客户端需要同源 Raw JSON 和 ZIP；这里只
+     * 兼容严格的两段 owner/repository 路径，并固定到 main/index.json，不发起网页请求、不跟随重定向，
+     * 也不接受 branch、子路径或查询参数。其他 HTTPS 静态源保持原样并继续经过主机、端口、凭据和片段
+     * 校验。空值只允许在配置读写阶段表示停用，实际网络请求 strict=true 时仍失败关闭。
+     */
     private function normalizeSourceUrl(string $value, bool $strict): string
     {
         $value = trim($value);
         if ($value === '' && !$strict) return '';
-        return $this->normalizeHttpsUrl($value, 2_000);
+        $normalized = $this->normalizeHttpsUrl($value, 2_000);
+        $parts = parse_url($normalized);
+        if (is_array($parts) && strtolower((string) ($parts['host'] ?? '')) === 'github.com') {
+            $path = (string) ($parts['path'] ?? '');
+            if (isset($parts['query'])
+                || preg_match('~^/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100}?)(?:\.git)?/?$~D', $path, $matches) !== 1
+                || $matches[2] === '.' || $matches[2] === '..') {
+                throw new PluginStoreInvalid('PLUGIN_STORE_URL_INVALID');
+            }
+            return 'https://raw.githubusercontent.com/' . $matches[1] . '/' . $matches[2] . '/main/index.json';
+        }
+        return $normalized;
     }
 
     private function normalizeHttpsUrl(string $value, int $maximum): string

@@ -2,7 +2,7 @@ name: velin-music
 
 x-backend-image: &backend-image
   # 公开 clone 与精简部署包默认只拉取 CI 已构建并签名的镜像；公开源码仅供审计或复建，不挂入容器。
-  image: ${VELIN_BACKEND_IMAGE:-ghcr.io/ttyob/velin-music:0.1.28}
+  image: ${VELIN_BACKEND_IMAGE:-ghcr.io/ttyob/velin-music:0.1.29}
 
 services:
   redis:

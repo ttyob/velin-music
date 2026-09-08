@@ -6,6 +6,7 @@ namespace app\controller\Api\V1;
 
 use app\application\Auth\AuthenticationRequired;
 use app\application\Auth\AuthorizationService;
+use app\application\System\BasicSystemSettingsService;
 use app\application\System\PublicUrlConfig;
 use app\application\System\DlnaSettingsService;
 use app\http\JsonResponseFactory;
@@ -31,6 +32,7 @@ final class AppCapabilityController
         $serverDlna = self::serverManagedDlnaAvailable();
         return JsonResponseFactory::create(['data' => [
             'product' => 'Velin Music',
+            'siteName' => self::configuredSiteName(),
             'apiVersion' => 'v1',
             'minimumAppVersion' => ['android' => '0.1.0', 'ios' => '0.1.0',
                 'windows' => '0.1.0', 'macos' => '0.1.0', 'linux' => '0.1.0'],
@@ -45,7 +47,7 @@ final class AppCapabilityController
             'outputScopes' => ['onDevice', 'nearbyNetwork', 'serverManaged'],
             'externalProtocols' => $external ? ['dlna', 'google_cast'] : [],
         ], 'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')]], 200, $requestId)
-            ->withHeader('Cache-Control', 'public, max-age=300');
+            ->withHeader('Cache-Control', 'no-cache');
     }
 
     /**
@@ -119,6 +121,22 @@ final class AppCapabilityController
             return (new DlnaSettingsService())->get()['enabled'] === true;
         } catch (\Throwable) {
             return false;
+        }
+    }
+
+    /**
+     * 返回匿名页面可展示的站点名称，同时保留固定 product 字段作为客户端兼容标识。
+     *
+     * 该值只来自已校验的 `site.basic` 公共展示字段，不投影版本、操作者或其他系统配置。初始化尚未
+     * 完成、迁移缺失或持久数据损坏时回退产品名，使登录和离线入口仍可渲染；读取没有写入或网络
+     * 副作用，修复配置后下一次协商即可恢复自定义名称。
+     */
+    public static function configuredSiteName(): string
+    {
+        try {
+            return (new BasicSystemSettingsService())->get()['siteName'];
+        } catch (\Throwable) {
+            return 'Velin Music';
         }
     }
 

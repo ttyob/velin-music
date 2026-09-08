@@ -1,4 +1,4 @@
-# Velin Music 0.1.28
+# Velin Music 0.1.29
 
 <p align="center">
   <strong>自托管音乐库、播放器与媒体服务</strong><br>
@@ -93,7 +93,7 @@ VELIN_OWNTONE_IMAGE=<受信仓库>/owntone@sha256:<摘要>
 正式稳定版将同时公布国内可访问的镜像地址与校验信息。
 
 公开 `main` 始终对应最近一次稳定导出。需要精确复现版本时使用
-`git clone --branch v0.1.28 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
+`git clone --branch v0.1.29 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
 镜像标签均禁止覆盖。
 
 ### 使用 Release 精简部署包
@@ -102,7 +102,7 @@ Release 部署包只包含 Compose、初始化脚本和空持久目录，其中 
 digest。源码无需重复打包，可直接使用公开仓库或 GitHub 自动生成的 Source code 附件。
 
 ```bash
-VERSION=0.1.28
+VERSION=0.1.29
 curl -fL -o "velin-music-deploy-${VERSION}.tar.gz" \
   "https://github.com/ttyob/velin-music/releases/download/v${VERSION}/velin-music-deploy-${VERSION}.tar.gz"
 tar -xzf "velin-music-deploy-${VERSION}.tar.gz"
@@ -170,6 +170,8 @@ docker compose stop
 
 公开插件归档和 `index.json` 位于独立的
 [Velin Music 插件库](https://github.com/ttyob/velin-music-plugins)，Velin Music Release 不重复附加插件 ZIP。
+后台插件应用商店可直接填写该仓库首页；服务端会将规范 GitHub 仓库地址转换为 main 分支的 Raw
+`index.json`，也继续接受完整 Raw 索引直链。
 
 Git 标签部署使用同版本不可变镜像标签；Release 精简部署包固定镜像 digest，适合要求供应链精确复现的
 生产环境。发布流程不会覆盖已经存在的版本标签或附件。
