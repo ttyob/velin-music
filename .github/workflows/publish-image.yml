@@ -115,6 +115,26 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # buildx 的成功只能证明镜像可以构建，不能证明公开根 compose.yaml 的依赖、entrypoint 与健康检查
+      # 能共同收敛。这里强制使用本次输出 digest 进行一次全新安装；任何服务不健康都输出诊断并阻止签名
+      # 和 Release。持久数据只写入一次性 Runner，随后无论成功失败都删除容器与命名卷。
+      - name: Smoke-test published Compose
+        env:
+          VELIN_BACKEND_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          docker compose pull
+          if ! docker compose up -d --wait; then
+            docker compose ps --all
+            docker compose logs --no-color backend redis owntone
+            exit 1
+          fi
+          docker compose ps
+
+      - name: Clean up Compose smoke test
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3.7.0
 
