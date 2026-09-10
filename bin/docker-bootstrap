@@ -12,6 +12,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BACKEND_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 TEMPLATE_FILE="$BACKEND_DIR/.env.docker.example"
 COMPOSE_FILE="$BACKEND_DIR/compose.yaml"
+PROJECT_NAME=${COMPOSE_PROJECT_NAME:-velin-music}
 HOST_DATA_ROOT="$BACKEND_DIR/docker-data"
 HOST_STORAGE_ROOT="$BACKEND_DIR/storage"
 
@@ -257,6 +258,7 @@ prepare_data_layout()
     database_dir="$data_root/database"
     runtime_dir="$data_root/runtime"
     plugin_dir="$data_root/plugins"
+    redis_dir="$data_root/redis"
     cache_root="$data_root/cache"
     scrape_cache="$cache_root/scrape"
     library_root="$storage_root/music"
@@ -269,17 +271,13 @@ prepare_data_layout()
         [ -w "$persistent_dir" ] || fail "Persistent directory is not writable: $persistent_dir"
         [ -x "$persistent_dir" ] || fail "Persistent directory is not searchable: $persistent_dir"
     done
-    if [ "$MODE" != compose ]; then
-        [ -r "$BACKEND_DIR/docker/owntone/owntone.conf" ] \
-            || fail "OwnTone configuration is missing: $BACKEND_DIR/docker/owntone/owntone.conf"
-    fi
-    for managed_path in "$cache_root" "$scrape_cache" "$library_root" "$download_root"; do
+    for managed_path in "$cache_root" "$scrape_cache" "$redis_dir" "$library_root" "$download_root"; do
         [ ! -L "$managed_path" ] || fail "Refusing symlinked managed directory: $managed_path"
         if [ -e "$managed_path" ] && [ ! -d "$managed_path" ]; then
             fail "Managed directory is not a directory: $managed_path"
         fi
     done
-    mkdir -p -- "$scrape_cache" "$library_root" "$download_root"
+    mkdir -p -- "$scrape_cache" "$redis_dir" "$library_root" "$download_root"
 
     DATA_REAL=$(CDPATH= cd -- "$data_root" && pwd -P)
     STORAGE_REAL=$(CDPATH= cd -- "$storage_root" && pwd -P)
@@ -287,11 +285,14 @@ prepare_data_layout()
     LIBRARY_REAL=$(CDPATH= cd -- "$library_root" && pwd -P)
     DOWNLOAD_REAL=$(CDPATH= cd -- "$download_root" && pwd -P)
     SCRAPE_CACHE_REAL=$(CDPATH= cd -- "$scrape_cache" && pwd -P)
+    REDIS_REAL=$(CDPATH= cd -- "$redis_dir" && pwd -P)
     [ -r "$STORAGE_REAL" ] || fail "Storage directory is not readable: $STORAGE_REAL"
     [ -x "$STORAGE_REAL" ] || fail "Storage directory is not searchable: $STORAGE_REAL"
     [ -w "$DOWNLOAD_REAL" ] || fail "Download directory is not writable: $DOWNLOAD_REAL"
     [ -w "$SCRAPE_CACHE_REAL" ] || fail "Scrape cache directory is not writable: $SCRAPE_CACHE_REAL"
     [ -x "$SCRAPE_CACHE_REAL" ] || fail "Scrape cache directory is not searchable: $SCRAPE_CACHE_REAL"
+    [ -w "$REDIS_REAL" ] || fail "Redis data directory is not writable: $REDIS_REAL"
+    [ -x "$REDIS_REAL" ] || fail "Redis data directory is not searchable: $REDIS_REAL"
     case "${LIBRARY_REAL}/" in
         "${SCRAPE_CACHE_REAL}/"*) fail 'Default library and scrape cache directories must not overlap.' ;;
     esac
@@ -329,7 +330,11 @@ assert_available_space()
 project_service_is_running()
 {
     service=$1
-    container_id=$(docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" ps -q "$service" 2>/dev/null \
+    # 直接按 Compose 标签查询，使新定义已经删除的旧 owntone orphan 仍能被识别为当前项目所有。
+    container_id=$(docker ps \
+        --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+        --filter "label=com.docker.compose.service=$service" \
+        --format '{{.ID}}' 2>/dev/null \
         | awk 'NR == 1 { print; exit }')
     [ -n "$container_id" ] || return 1
     [ "$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null)" = true ]
@@ -377,12 +382,29 @@ assert_available_space "$DOCKER_ROOT" 4194304 'Docker filesystem'
 
 docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" config --quiet
 assert_port_available_or_owned 8787 backend
-assert_port_available_or_owned 16379 redis
-assert_port_available_or_owned 3689 owntone
+# Redis 作为 backend 内部进程使用固定 27379；已有 backend 占用表示幂等更新，其他进程占用必须在启动
+# 前失败关闭。旧 16379 不再属于当前拓扑，也不会被误认为新服务已就绪。
+if port_is_listening 27379; then
+    if project_service_is_running backend || project_service_is_running redis; then
+        printf 'Port 27379 is already owned by a running Velin Redis service.\n' >&2
+    else
+        fail 'Host port 27379 required by embedded Redis is already in use by another process.'
+    fi
+fi
+# AirPlay 开启后 3689 由 backend 容器内 OwnTone 使用；升级前旧版独立 owntone 容器仍可能监听该端口，
+# `--remove-orphans` 会在创建新版 backend 前移除它。预检只允许当前项目的 backend 或遗留 owntone 所有权。
+if port_is_listening 3689; then
+    if project_service_is_running backend || project_service_is_running owntone; then
+        printf 'Port 3689 is already owned by a running Velin AirPlay service.\n' >&2
+    else
+        fail 'Host port 3689 required by embedded AirPlay is already in use by another process.'
+    fi
+fi
 printf 'Docker host, disk, port and mount preflight passed.\n' >&2
 
-# `--wait` 只在 backend、Redis 与 OwnTone 都达到 Compose 定义的 healthy 状态后成功。构建或启动失败
-# 保留 SQLite、媒体目录、命名卷和已生成密钥，运维修复环境后可幂等重试；脚本不执行 down、删除或回滚。
+# `--remove-orphans` 只移除当前 Compose 项目已不再声明的旧容器，用于释放旧版独立 OwnTone 的 3689；
+# 不删除卷、SQLite、媒体或密钥。`--wait` 只要求唯一 backend 容器健康；内置 Redis 是其强制健康条件，
+# AirPlay 默认关闭不影响整体健康。
 docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" \
-    up -d --build --wait --wait-timeout 180
+    up -d --build --remove-orphans --wait --wait-timeout 180
 docker compose --file "$COMPOSE_FILE" --project-directory "$BACKEND_DIR" ps

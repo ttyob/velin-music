@@ -50,7 +50,7 @@ return [
         ],
         'redis' => [
             'host' => getenv('VELIN_REDIS_HOST') ?: '127.0.0.1',
-            'port' => (int) (getenv('VELIN_REDIS_PORT') ?: 16379),
+            'port' => (int) (getenv('VELIN_REDIS_PORT') ?: 27379),
             'auth' => getenv('VELIN_REDIS_PASSWORD') ?: '',
             'timeout' => (float) (getenv('VELIN_REDIS_TIMEOUT') ?: 2),
             'database' => (int) (getenv('VELIN_REDIS_DATABASE') ?: 0),

@@ -52,7 +52,7 @@ final class RedisSessionHealthProbe implements HealthProbe
     {
         if (!class_exists(Redis::class)) throw new RuntimeException('REDIS_EXTENSION_UNAVAILABLE');
         $host = (string) (getenv('VELIN_REDIS_HOST') ?: '127.0.0.1');
-        $port = max(1, min(65535, (int) (getenv('VELIN_REDIS_PORT') ?: 16379)));
+        $port = max(1, min(65535, (int) (getenv('VELIN_REDIS_PORT') ?: 27379)));
         $timeout = max(0.05, min(0.5, (float) (getenv('VELIN_REDIS_TIMEOUT') ?: 0.5)));
         $redis = new Redis();
         if (!$redis->pconnect($host, $port, $timeout, 'velin-health-' . getmypid(), 0, $timeout)) {

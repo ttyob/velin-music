@@ -1,0 +1,173 @@
+#!/bin/sh
+set -eu
+
+# 该内部 helper 只接受固定生命周期动作，并只操作镜像内已知可执行文件与受控 runtime PID 文件。
+# start 按 D-Bus -> Avahi -> OwnTone 启动，stop 逆序退出。每次发信号前都核对 /proc/<pid>/exe，PID
+# 被复用或文件损坏时立即失败且不发送信号。D-Bus 降权使 exe 不可读时额外核对固定 UID 与 argv0；正常
+# 重复启停幂等。启动中途失败会逆序补偿本次进程组，OwnTone 数据库与缓存保留在
+# /data/cache/owntone，后续周期可以重试，不会修改业务数据库。
+
+RUNTIME_DIR=${VELIN_AIRPLAY_RUNTIME_DIR:-/data/runtime/airplay}
+DBUS_BIN=${VELIN_AIRPLAY_DBUS_BIN:-/usr/bin/dbus-daemon}
+AVAHI_BIN=${VELIN_AIRPLAY_AVAHI_BIN:-/usr/sbin/avahi-daemon}
+OWNTONE_BIN=${VELIN_AIRPLAY_OWNTONE_BIN:-/usr/sbin/owntone}
+OWNTONE_CONFIG=${VELIN_AIRPLAY_OWNTONE_CONFIG:-/etc/owntone/owntone.conf}
+
+case "$RUNTIME_DIR" in
+    /*) ;;
+    *) exit 70 ;;
+esac
+
+pid_file()
+{
+    printf '%s/%s.pid\n' "$RUNTIME_DIR" "$1"
+}
+
+read_pid()
+{
+    file=$(pid_file "$1")
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    pid=$(sed -n '1p' "$file")
+    case "$pid" in ''|*[!0-9]*|0) return 1 ;; esac
+    printf '%s\n' "$pid"
+}
+
+same_executable()
+{
+    pid=$1
+    expected=$2
+    wanted=$(readlink -f "$expected" 2>/dev/null) || return 1
+    if actual=$(readlink -f "/proc/$pid/exe" 2>/dev/null); then
+        [ "$actual" = "$wanted" ]
+        return
+    fi
+
+    # system D-Bus 按发行版策略降权为 messagebus 后，Linux 会拒绝容器 root 解引用该进程的 exe。
+    # 兜底只允许固定 D-Bus：真实 UID 必须等于镜像内 messagebus，argv0 仍须解析到同一固定二进制；
+    # Avahi、OwnTone 或任何未知进程都没有该例外，避免 PID 复用时仅凭进程名发送信号。
+    [ "$expected" = "$DBUS_BIN" ] || return 1
+    messagebus_uid=$(id -u messagebus 2>/dev/null) || return 1
+    process_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$pid/status" 2>/dev/null) || return 1
+    first_argument=$(tr '\000' '\n' <"/proc/$pid/cmdline" 2>/dev/null | sed -n '1p') || return 1
+    argument_executable=$(readlink -f "$first_argument" 2>/dev/null) || return 1
+    [ "$process_uid" = "$messagebus_uid" ] && [ "$argument_executable" = "$wanted" ]
+}
+
+process_is_zombie()
+{
+    [ "$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' "/proc/$1/status" 2>/dev/null)" = Z ]
+}
+
+process_running()
+{
+    name=$1
+    binary=$2
+    pid=$(read_pid "$name") || return 1
+    kill -0 "$pid" 2>/dev/null && same_executable "$pid" "$binary"
+}
+
+start_process()
+{
+    name=$1
+    binary=$2
+    shift 2
+    file=$(pid_file "$name")
+    if process_running "$name" "$binary"; then return 0; fi
+    if pid=$(read_pid "$name") && kill -0 "$pid" 2>/dev/null && ! process_is_zombie "$pid"; then
+        return 70
+    fi
+    [ -x "$binary" ] && [ ! -L "$binary" ] || return 69
+    if [ -e "$file" ]; then
+        [ -f "$file" ] && [ ! -L "$file" ] || return 70
+        unlink "$file"
+    fi
+    # Alpine runtime 不携带 OpenRC 的 start-stop-daemon。nohup 在独立后台进程中直接 exec 固定二进制，
+    # $! 因此就是需要校验和回收的服务 PID；标准流断开，避免 companion 持有请求进程管道导致启用接口挂起。
+    nohup "$binary" "$@" </dev/null >/dev/null 2>&1 &
+    pid=$!
+    umask 077
+    printf '%s\n' "$pid" >"$file"
+    attempt=0
+    while [ "$attempt" -lt 50 ]; do
+        if process_running "$name" "$binary"; then return 0; fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+stop_process()
+{
+    name=$1
+    binary=$2
+    file=$(pid_file "$name")
+    pid=$(read_pid "$name") || {
+        if [ -e "$file" ]; then
+            [ -f "$file" ] && [ ! -L "$file" ] || return 70
+            unlink "$file"
+        fi
+        return 0
+    }
+    if ! kill -0 "$pid" 2>/dev/null || process_is_zombie "$pid"; then
+        unlink "$file"
+        return 0
+    fi
+    same_executable "$pid" "$binary" || return 70
+    kill -TERM "$pid"
+    attempt=0
+    while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 50 ]; do
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        same_executable "$pid" "$binary" || return 70
+        kill -KILL "$pid"
+    fi
+    unlink "$file"
+}
+
+all_running()
+{
+    process_running dbus "$DBUS_BIN" \
+        && process_running avahi "$AVAHI_BIN" \
+        && process_running owntone "$OWNTONE_BIN" \
+        && wget -q -T 1 -O /dev/null http://127.0.0.1:3689/api/player
+}
+
+stop_all()
+{
+    result=0
+    stop_process owntone "$OWNTONE_BIN" || result=$?
+    stop_process avahi "$AVAHI_BIN" || result=$?
+    stop_process dbus "$DBUS_BIN" || result=$?
+    return "$result"
+}
+
+start_all()
+{
+    mkdir -p "$RUNTIME_DIR" "$RUNTIME_DIR/media" /run/dbus /data/cache/owntone
+    chmod 0700 "$RUNTIME_DIR"
+    dbus-uuidgen --ensure=/etc/machine-id
+    if ! start_process dbus "$DBUS_BIN" --system --nofork --nopidfile --nosyslog \
+        || ! start_process avahi "$AVAHI_BIN" --no-chroot --no-drop-root \
+        || ! start_process owntone "$OWNTONE_BIN" -f -c "$OWNTONE_CONFIG"; then
+        stop_all || true
+        return 1
+    fi
+    attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        if all_running; then return 0; fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    stop_all || true
+    return 1
+}
+
+[ "$#" -eq 1 ] || exit 64
+case "$1" in
+    start) start_all ;;
+    stop) stop_all ;;
+    status) all_running ;;
+    *) exit 64 ;;
+esac

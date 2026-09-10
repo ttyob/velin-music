@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace app\application\Airplay;
 
 use app\application\Dlna\DlnaTicketService;
+use app\application\System\AirplayFeatureGate;
+use app\application\System\AirplaySettingsService;
 use app\http\RequestContext;
 use app\infrastructure\Airplay\OwnToneClient;
 use app\infrastructure\Airplay\RedisAirplayServiceLease;
@@ -26,6 +28,7 @@ final readonly class AirplayService
         private AirplayServiceLease $lease = new RedisAirplayServiceLease(),
         private DlnaTicketService $tickets = new DlnaTicketService(),
         private AuditLogger $audit = new AuditLogger(),
+        private AirplayFeatureGate $settings = new AirplaySettingsService(),
     ) {
     }
 
@@ -40,6 +43,7 @@ final readonly class AirplayService
     public function discover(array $actor): array
     {
         $this->assertAuthorized($actor);
+        $this->settings->assertEnabled();
         return array_map(static fn (array $output): array => [
             'id' => 'airplay:' . $output['id'],
             'name' => $output['name'],
@@ -61,6 +65,7 @@ final readonly class AirplayService
     public function play(array $actor, string $deviceId, string $songId, string $requestId): array
     {
         $this->assertAuthorized($actor);
+        $this->settings->assertEnabled();
         $outputId = $this->outputId($deviceId);
         $newLease = $this->lease->acquire($actor);
         $ticketId = null;
@@ -120,6 +125,7 @@ final readonly class AirplayService
         string $requestId,
     ): array {
         $this->assertAuthorized($actor);
+        $this->settings->assertEnabled();
         $outputId = $this->outputId($deviceId);
         if ($operation === 'status') {
             $newLease = $this->lease->acquire($actor, false);
@@ -158,7 +164,7 @@ final readonly class AirplayService
         return ['succeeded' => true, 'deviceId' => $deviceId, 'operation' => $operation];
     }
 
-    /** 默认开箱启用，但每次调用都实时要求 play 与独立 cast。 */
+    /** 每次调用都先实时要求 play 与独立 cast，再读取全站开关，避免向无权限账号泄露服务状态。 */
     private function assertAuthorized(array $actor): void
     {
         $capabilities = is_array($actor['capabilities'] ?? null) ? $actor['capabilities'] : [];

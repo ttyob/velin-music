@@ -124,9 +124,9 @@ jobs:
         run: |
           set -eu
           docker compose pull
-          if ! docker compose up -d --wait; then
+          if ! docker compose up -d --remove-orphans --wait; then
             docker compose ps --all
-            docker compose logs --no-color backend redis owntone
+            docker compose logs --no-color backend
             exit 1
           fi
           docker compose ps
@@ -245,7 +245,7 @@ jobs:
                   fi
                 fi
                 docker compose pull backend
-                docker compose up -d --wait
+                docker compose up -d --remove-orphans --wait
                 rollback_status=$?
                 if [ "$rollback_status" -eq 0 ]; then
                   echo '发布失败，已恢复旧版本' >&2
@@ -290,6 +290,6 @@ jobs:
             fi
             mv -- "$env_next" .env
             database_may_have_changed=true
-            docker compose up -d --wait
+            docker compose up -d --remove-orphans --wait
             rollback_required=false
             echo "Velin Music $DEPLOY_RELEASE 部署完成，冷备份位于 $backup_dir"

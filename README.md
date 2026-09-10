@@ -1,4 +1,4 @@
-# Velin Music 0.1.29
+# Velin Music 0.1.30
 
 <p align="center">
   <strong>自托管音乐库、播放器与媒体服务</strong><br>
@@ -77,7 +77,7 @@ Go 网关只负责高并发的静态和媒体读取；Webman 负责认证、授�
 ```bash
 git clone https://github.com/ttyob/velin-music.git
 cd velin-music
-docker compose up -d --wait
+docker compose up -d --remove-orphans --wait
 docker compose ps
 ```
 
@@ -85,15 +85,14 @@ docker compose ps
 
 ```dotenv
 VELIN_BACKEND_IMAGE=<受信仓库>/velin-music@sha256:<摘要>
-VELIN_REDIS_IMAGE=<受信仓库>/redis@sha256:<摘要>
-VELIN_OWNTONE_IMAGE=<受信仓库>/owntone@sha256:<摘要>
 ```
 
-覆盖地址必须来自可信仓库并与发布方公布的摘要一致；不要使用来源和缓存内容无法审计的公共加速地址。
-正式稳定版将同时公布国内可访问的镜像地址与校验信息。
+Redis、OwnTone、Avahi 与 D-Bus 已包含在同一个 backend 镜像中。覆盖地址必须来自可信仓库并与发布方公布
+的摘要一致；不要使用来源和缓存内容无法审计的公共加速地址。正式稳定版将同时公布国内可访问的镜像地址
+与校验信息。
 
 公开 `main` 始终对应最近一次稳定导出。需要精确复现版本时使用
-`git clone --branch v0.1.29 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
+`git clone --branch v0.1.30 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
 镜像标签均禁止覆盖。
 
 ### 使用 Release 精简部署包
@@ -102,7 +101,7 @@ Release 部署包只包含 Compose、初始化脚本和空持久目录，其中 
 digest。源码无需重复打包，可直接使用公开仓库或 GitHub 自动生成的 Source code 附件。
 
 ```bash
-VERSION=0.1.29
+VERSION=0.1.30
 curl -fL -o "velin-music-deploy-${VERSION}.tar.gz" \
   "https://github.com/ttyob/velin-music/releases/download/v${VERSION}/velin-music-deploy-${VERSION}.tar.gz"
 tar -xzf "velin-music-deploy-${VERSION}.tar.gz"
@@ -111,7 +110,7 @@ cd "velin-music-deploy-${VERSION}"
 # 可选但推荐：确认部署配置未被篡改
 sha256sum -c CONTENTS.sha256
 
-docker compose up -d --wait
+docker compose up -d --remove-orphans --wait
 docker compose ps
 ```
 
@@ -124,6 +123,7 @@ docker compose ps
 | 宿主机目录 | 容器路径 | 用途 |
 | --- | --- | --- |
 | `docker-data/` | `/data` | SQLite、配置、运行时文件、插件和刮削缓存 |
+| `docker-data/redis/` | `/data/redis` | Redis AOF/RDB 持久数据 |
 | `docker-data/cache/scrape/` | `/data/cache/scrape` | 可重建的歌词、封面和刮削结果 |
 | `storage/music/` | `/storage/music` | 音乐库原始文件 |
 | `storage/downloads/` | `/storage/downloads` | 插件下载的临时或待整理文件 |
@@ -139,14 +139,14 @@ docker compose ps
 docker compose logs -f --tail=200 backend
 
 # 升级到新的稳定标签或 Release 部署包后执行
-docker compose up -d --wait
+docker compose up -d --remove-orphans --wait
 
 # 停止服务（保留数据）
 docker compose stop
 ```
 
-升级前请保留 `docker-data/database/` 的备份。不要执行 `docker compose down -v`，否则会删除 Redis 持久化
-卷。部署包配套的自动升级流程会在迁移前创建 SQLite 冷备份，健康检查失败时恢复旧环境。
+升级前请保留 `docker-data/database/` 的备份；Redis 数据与其他运行数据一样保存在 `docker-data/redis/`，
+不再使用独立命名卷。部署包配套的自动升级流程会在迁移前创建 SQLite 冷备份，健康检查失败时恢复旧环境。
 
 ## 插件
 

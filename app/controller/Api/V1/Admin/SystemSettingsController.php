@@ -24,6 +24,11 @@ use app\application\System\DlnaSettingsInvalid;
 use app\application\System\DlnaSettingsService;
 use app\application\System\DlnaSettingsUnavailable;
 use app\application\Dlna\DlnaHelperSupervisor;
+use app\application\Airplay\AirplayCompanionSupervisor;
+use app\application\System\AirplaySettingsConflict;
+use app\application\System\AirplaySettingsInvalid;
+use app\application\System\AirplaySettingsService;
+use app\application\System\AirplaySettingsUnavailable;
 use app\application\System\RuntimeMaintenanceInvalid;
 use app\application\System\RuntimeMaintenanceService;
 use app\application\System\RuntimeMaintenanceUnavailable;
@@ -187,6 +192,75 @@ final class SystemSettingsController
     }
 
     /**
+     * 读取全站 AirPlay 开关与实际运行状态。
+     *
+     * 仅 `manage_system` 管理员可见；running 通过固定 helper 的 PID 身份与本机健康检查得到，响应不包含
+     * 可执行路径、PID、端口响应、设备或配对信息。持久设置可读但 companion 故障时仍返回 running=false。
+     */
+    public function showAirplay(Request $request): Response
+    {
+        return $this->execute($request, static function (): array {
+            $settings = (new AirplaySettingsService())->get();
+            return [...$settings, 'running' => self::airplayRunning(new AirplayCompanionSupervisor())];
+        });
+    }
+
+    /**
+     * 原子更新 AirPlay 开关，并在事务提交后立即协调内置进程组。
+     *
+     * OwnTone 启停不能与 SQLite 原子提交：设置是唯一期望状态，running 是本次协调后的事实。启动失败
+     * 不撤销设置，周期 Worker 会继续恢复；停止失败同样不伪造成功状态，日志只记录异常类型与 requestId。
+     */
+    public function updateAirplay(Request $request): Response
+    {
+        return $this->execute($request, static function (array $actor) use ($request): array {
+            $payload = $request->post();
+            if (!is_array($payload)) {
+                throw new AirplaySettingsInvalid('AirPlay 设置参数无效。');
+            }
+            $updated = (new AirplaySettingsService())->update(
+                $payload,
+                (string) $actor['id'],
+                RequestContext::requestId(),
+            );
+            $supervisor = new AirplayCompanionSupervisor();
+            try {
+                if ($updated['enabled']) {
+                    $supervisor->start();
+                } else {
+                    $supervisor->stop();
+                }
+            } catch (Throwable $lifecycleFailure) {
+                Log::warning('AirPlay companion lifecycle reconciliation failed.', [
+                    'request_id' => RequestContext::requestId(),
+                    'enabled' => $updated['enabled'],
+                    'exception_class' => $lifecycleFailure::class,
+                ]);
+            }
+            return [...$updated, 'running' => self::airplayRunning($supervisor)];
+        });
+    }
+
+    /**
+     * 把 companion 状态探测收敛为不泄露细节的布尔事实。
+     *
+     * 设置读写与进程状态无法组成同一事务；锁或 helper 短暂不可用时必须保留已提交的期望状态并返回
+     * running=false，交给周期 Worker 恢复。日志只记录异常类型和 requestId，不包含 PID 或系统路径。
+     */
+    private static function airplayRunning(AirplayCompanionSupervisor $supervisor): bool
+    {
+        try {
+            return $supervisor->running();
+        } catch (Throwable $statusFailure) {
+            Log::warning('AirPlay companion status probe failed.', [
+                'request_id' => RequestContext::requestId(),
+                'exception_class' => $statusFailure::class,
+            ]);
+            return false;
+        }
+    }
+
+    /**
      * 严格接收完整全局限制对象并执行原子版本替换。
      *
      * actor ID 只来自实时认证主体，CSRF 由路由中间件先行验证。成功只改变后续播放、转码、下载或任务
@@ -273,6 +347,9 @@ final class SystemSettingsController
             if ($throwable instanceof DlnaSettingsInvalid) {
                 return JsonResponseFactory::error('DLNA_SETTINGS_VALIDATION_FAILED', 'DLNA 设置参数无效。', 422, $requestId);
             }
+            if ($throwable instanceof AirplaySettingsInvalid) {
+                return JsonResponseFactory::error('AIRPLAY_SETTINGS_VALIDATION_FAILED', 'AirPlay 设置参数无效。', 422, $requestId);
+            }
             if ($throwable instanceof RuntimeMaintenanceInvalid) {
                 return JsonResponseFactory::error('RUNTIME_MAINTENANCE_VALIDATION_FAILED', '清理分类无效。', 422, $requestId);
             }
@@ -294,6 +371,9 @@ final class SystemSettingsController
             if ($throwable instanceof DlnaSettingsConflict) {
                 return JsonResponseFactory::error('DLNA_SETTINGS_VERSION_CONFLICT', 'DLNA 设置已变化，请刷新后重试。', 409, $requestId);
             }
+            if ($throwable instanceof AirplaySettingsConflict) {
+                return JsonResponseFactory::error('AIRPLAY_SETTINGS_VERSION_CONFLICT', 'AirPlay 设置已变化，请刷新后重试。', 409, $requestId);
+            }
             if ($throwable instanceof MetadataScrapePolicyConflict) {
                 return JsonResponseFactory::error('METADATA_SCRAPE_POLICY_VERSION_CONFLICT', '刮削配置已变化，请刷新后重试。', 409, $requestId);
             }
@@ -302,6 +382,7 @@ final class SystemSettingsController
                 || $throwable instanceof SystemLimitSettingsUnavailable
                 || $throwable instanceof NetworkProxySettingsUnavailable
                 || $throwable instanceof DlnaSettingsUnavailable
+                || $throwable instanceof AirplaySettingsUnavailable
                 || $throwable instanceof MetadataScrapePolicyUnavailable
                 ? 'SYSTEM_SETTINGS_UNAVAILABLE'
                 : 'SYSTEM_SETTINGS_REQUEST_FAILED';

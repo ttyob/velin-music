@@ -1,0 +1,120 @@
+#!/bin/sh
+set -eu
+
+# Redis 是 backend 容器的必需内部进程，只监听固定宿主回环端口并把持久文件写入 `/data` 运行挂载。
+# helper 只接受固定 start|stop|status，不接收路径、端口或命令参数。每次发信号前必须通过
+# /proc/<pid>/exe 核对进程身份；陈旧、复用或损坏 PID 均失败关闭。start/status 幂等，SIGTERM 允许
+# Redis 在退出前完成 AOF 刷盘；停止超时不升级 SIGKILL，由容器停止边界保留现场并报告失败。
+
+RUNTIME_DIR=/data/runtime/redis
+DATA_DIR=/data/redis
+PID_FILE=$RUNTIME_DIR/redis.pid
+REDIS_BIN=/usr/bin/redis-server
+REDIS_CLI=/usr/bin/redis-cli
+
+read_pid()
+{
+    [ -f "$PID_FILE" ] && [ ! -L "$PID_FILE" ] || return 1
+    pid=$(sed -n '1p' "$PID_FILE")
+    case "$pid" in ''|*[!0-9]*|0) return 1 ;; esac
+    printf '%s\n' "$pid"
+}
+
+same_executable()
+{
+    pid=$1
+    [ -e "/proc/$pid/exe" ] || return 1
+    actual=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
+    expected=$(readlink -f "$REDIS_BIN" 2>/dev/null) || return 1
+    [ "$actual" = "$expected" ]
+}
+
+process_is_zombie()
+{
+    [ "$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' "/proc/$1/status" 2>/dev/null)" = Z ]
+}
+
+running()
+{
+    pid=$(read_pid) || return 1
+    kill -0 "$pid" 2>/dev/null \
+        && ! process_is_zombie "$pid" \
+        && same_executable "$pid" \
+        && "$REDIS_CLI" -h 127.0.0.1 -p 27379 ping 2>/dev/null | grep -qx PONG
+}
+
+start_redis()
+{
+    if running; then return 0; fi
+    if pid=$(read_pid) && kill -0 "$pid" 2>/dev/null && ! process_is_zombie "$pid"; then
+        return 70
+    fi
+    [ -x "$REDIS_BIN" ] && [ ! -L "$REDIS_BIN" ] \
+        && [ -x "$REDIS_CLI" ] && [ ! -L "$REDIS_CLI" ] || return 69
+    mkdir -p "$RUNTIME_DIR" "$DATA_DIR"
+    [ ! -L "$RUNTIME_DIR" ] && [ ! -L "$DATA_DIR" ] || return 70
+    chmod 0700 "$RUNTIME_DIR" "$DATA_DIR"
+    if [ -e "$PID_FILE" ]; then
+        [ -f "$PID_FILE" ] && [ ! -L "$PID_FILE" ] || return 70
+        unlink "$PID_FILE"
+    fi
+
+    nohup "$REDIS_BIN" \
+        --bind 127.0.0.1 \
+        --protected-mode yes \
+        --port 27379 \
+        --appendonly yes \
+        --appendfsync everysec \
+        --save 60 1 \
+        --dir "$DATA_DIR" \
+        --daemonize no \
+        --logfile '' \
+        </dev/null >/proc/1/fd/1 2>/proc/1/fd/2 &
+    pid=$!
+    umask 077
+    if ! printf '%s\n' "$pid" >"$PID_FILE"; then
+        if same_executable "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+        return 1
+    fi
+
+    attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        if running; then return 0; fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    if same_executable "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+    return 1
+}
+
+stop_redis()
+{
+    pid=$(read_pid) || {
+        if [ -e "$PID_FILE" ]; then
+            [ -f "$PID_FILE" ] && [ ! -L "$PID_FILE" ] || return 70
+            unlink "$PID_FILE"
+        fi
+        return 0
+    }
+    if ! kill -0 "$pid" 2>/dev/null || process_is_zombie "$pid"; then
+        unlink "$PID_FILE"
+        return 0
+    fi
+    same_executable "$pid" || return 70
+    kill -TERM "$pid"
+    attempt=0
+    while kill -0 "$pid" 2>/dev/null && ! process_is_zombie "$pid" && [ "$attempt" -lt 100 ]; do
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null && ! process_is_zombie "$pid"; then return 1; fi
+    unlink "$PID_FILE"
+}
+
+[ "$#" -eq 1 ] || exit 64
+case "$1" in
+    start) start_redis ;;
+    stop) stop_redis ;;
+    status) running ;;
+    *) exit 64 ;;
+esac

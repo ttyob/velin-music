@@ -1,13 +1,13 @@
-# Velin Music Docker 精简部署包 0.1.29
+# Velin Music Docker 精简部署包 0.1.30
 
-这个目录只包含 Docker Compose、初始化脚本、OwnTone 配置和空持久目录，不重复包含 GitHub 标签已经
-提供的公开源码。Compose 只拉取已经由 CI 构建的 backend 镜像 `ghcr.io/ttyob/velin-music:0.1.29`，不会在部署主机重新安装依赖
+这个目录只包含 Docker Compose、初始化脚本和空持久目录，不重复包含 GitHub 标签已经
+提供的公开源码。Compose 只拉取已经由 CI 构建的 backend 镜像 `ghcr.io/ttyob/velin-music:0.1.30`，不会在部署主机重新安装依赖
 或构建源码。当前公开平台为 `linux/amd64`。
 
 ## 启动
 
 ```bash
-docker compose up -d --wait
+docker compose up -d --remove-orphans --wait
 docker compose ps
 ```
 
@@ -30,10 +30,11 @@ docker compose ps
 仓库及 GitHub 自动生成的 Source code 附件提供。升级时应使用新 Release 的 digest 固定部署包；数据库
 迁移后的回滚必须同时恢复升级前冷备份，不能只改回镜像标签。
 
-不要执行 `docker compose down -v`，否则会删除 Redis 持久卷。生产密钥由 entrypoint 生成在
-`docker-data/config/.env`，不得提交到公开仓库或写入镜像；部署根 `.env` 只是可选的 Compose 镜像覆盖
-配置，默认启动不要求创建。
+Redis AOF/RDB 与其他运行数据统一保存在 `docker-data/redis/`，不再使用独立命名卷。生产密钥由
+entrypoint 生成在 `docker-data/config/.env`，不得提交到公开仓库或写入镜像；部署根 `.env` 只是可选的
+Compose 镜像覆盖配置，默认启动不要求创建。
 
-默认仓库无法访问时，可在部署根 `.env` 中设置 `VELIN_BACKEND_IMAGE`、`VELIN_REDIS_IMAGE` 和
-`VELIN_OWNTONE_IMAGE`，再执行 Compose。覆盖值只应使用发布方同步并公布校验信息的可信镜像；不得把
-来源不明的公共加速地址作为生产依赖。首个正式稳定版发布前必须提供国内可访问的受信镜像地址。
+默认仓库无法访问时，可在部署根 `.env` 中设置 `VELIN_BACKEND_IMAGE`，再执行 Compose。Redis、OwnTone、
+Avahi 与 D-Bus 均由 backend 镜像内置，不再配置独立镜像。覆盖值只应使用发布方同步并公布校验信息的
+可信镜像；不得把来源不明的公共加速地址作为生产依赖。首个正式稳定版发布前必须提供国内可访问的受信
+镜像地址。

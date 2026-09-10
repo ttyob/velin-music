@@ -16,6 +16,8 @@ use app\process\ResourcePluginEventWorker;
 use app\process\ResourcePluginTranscodeWorker;
 use app\process\ResourcePluginWorker;
 use app\process\UploadWorker;
+use app\process\AirplayCompanionWorker;
+use app\process\RedisCompanionWorker;
 use support\Log;
 use support\Request;
 
@@ -29,6 +31,19 @@ $runtimeMaintenanceEnabled = filter_var(getenv('VELIN_RUNTIME_MAINTENANCE_ENABLE
 $lastfmPlaylistSyncEnabled = filter_var(getenv('VELIN_LASTFM_SYNC_WORKER_ENABLED') ?: 'false', FILTER_VALIDATE_BOOL);
 
 return [
+    /*
+     * Docker 镜像把 Redis 作为 backend 必需内部进程；入口先启动，单实例 Worker 负责崩溃恢复和优雅
+     * 关闭。裸机没有镜像标记，继续由部署者管理 Redis，不能被应用生命周期误停。
+     */
+    'velin-redis-companion' => [
+        'handler' => RedisCompanionWorker::class,
+        'count' => 1,
+        'reloadable' => false,
+        'enable' => is_file(base_path('.velin-container')),
+        'constructor' => [
+            'interval' => 5.0,
+        ],
+    ],
     /*
      * Go 网关拥有唯一公开端口，仅把 API 和动态协议反代到回环 Webman；公开静态文件与 SPA 页面由 Go
      * 从独立 public 根直接发送。进程由 Workerman master 监督但不可热重载，避免 reload 窗口争用 8787。
@@ -153,6 +168,19 @@ return [
             'notificationCleanupTimeBudgetSeconds' => max(0.1, min(10.0, (float) (getenv('VELIN_NOTIFICATION_CLEANUP_TIME_BUDGET_SECONDS') ?: 2))),
             'runtimeMaintenanceEnabled' => $runtimeMaintenanceEnabled,
             'runtimeMaintenanceInterval' => max(3_600.0, (float) (getenv('VELIN_RUNTIME_MAINTENANCE_SECONDS') ?: 21_600)),
+        ],
+    ],
+    /*
+     * 单实例生命周期 Worker 只协调 backend 镜像内的 D-Bus、Avahi 与 OwnTone。它始终保持轻量事件循环，
+     * 但默认关闭设置不会启动 companion；容器重启或子进程异常退出后按数据库期望状态幂等恢复。
+     */
+    'velin-airplay-companion' => [
+        'handler' => AirplayCompanionWorker::class,
+        'count' => 1,
+        'reloadable' => false,
+        'enable' => filter_var(getenv('VELIN_AIRPLAY_WORKER_ENABLED') ?: 'true', FILTER_VALIDATE_BOOL),
+        'constructor' => [
+            'interval' => max(5.0, (float) (getenv('VELIN_AIRPLAY_RECONCILE_SECONDS') ?: 15)),
         ],
     ],
     /* 批量字段覆盖逐对象短事务执行；SQLite 阶段固定单消费者。 */

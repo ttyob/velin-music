@@ -8,6 +8,33 @@ WORKDIR /source
 COPY . .
 RUN sha256sum -c CONTENTS.sha256
 
+# 公开构建同样从固定发布包编译 OwnTone，避免官方容器与 backend Alpine 版本不同造成动态库漂移。
+FROM alpine:3.22 AS owntone-build
+ARG ALPINE_REPOSITORY
+ARG OWNTONE_VERSION=29.3
+ARG OWNTONE_SHA256=aa0cbfc5651aa65776a8bd2112c9e0a904b2185c837900d3f6494b9ec6e8c547
+WORKDIR /tmp/source
+RUN set -eux; \
+    sed -i "s#https://dl-cdn.alpinelinux.org/alpine#${ALPINE_REPOSITORY}#g" /etc/apk/repositories; \
+    apk add --no-cache \
+        alsa-lib-dev autoconf automake avahi-dev bison confuse-dev curl curl-dev ffmpeg-dev flex \
+        g++ gawk gcc gettext-dev gnutls-dev gperf json-c-dev libevent-dev libgcrypt-dev \
+        libplist-dev libsodium-dev libtool libunistring-dev libwebsockets-dev libxml2-dev make \
+        protobuf-c-dev sqlite-dev xz; \
+    curl --fail --location --retry 5 --retry-all-errors --connect-timeout 20 \
+        --output owntone.tar.xz \
+        "https://github.com/owntone/owntone-server/releases/download/${OWNTONE_VERSION}/owntone-${OWNTONE_VERSION}.tar.xz"; \
+    echo "${OWNTONE_SHA256}  owntone.tar.xz" | sha256sum -c -; \
+    tar -xf owntone.tar.xz --strip-components=1; \
+    autoreconf -fvi -I /usr/share/gettext/m4; \
+    ./configure --disable-install_systemd --disable-install_user --enable-chromecast \
+        --enable-silent-rules --infodir=/usr/share/info --localstatedir=/var \
+        --mandir=/usr/share/man --prefix=/usr --sysconfdir=/etc/owntone; \
+    make -j"$(nproc)"; \
+    make DESTDIR=/tmp/build install; \
+    install -D -m 0644 COPYING /tmp/build/usr/share/licenses/owntone/COPYING; \
+    test -x /tmp/build/usr/sbin/owntone
+
 # 公开仓库只接收私有 CI 生成的 public 静态文件和 amd64 Go Helper；源码不会在镜像构建阶段重新进入。
 FROM php:8.3-cli-alpine3.22 AS php-runtime-base
 
@@ -16,13 +43,30 @@ RUN set -eux; \
     sed -i "s#https://dl-cdn.alpinelinux.org/alpine#${ALPINE_REPOSITORY}#g" /etc/apk/repositories; \
     apk add --no-cache \
         curl \
+        avahi \
+        confuse \
+        dbus \
+        ffmpeg \
         freetype \
+        gnutls \
+        json-c \
+        libevent \
+        libgcrypt \
         libjpeg-turbo \
+        libplist \
         libpng \
+        libsodium \
+        libunistring \
+        libuuid \
+        libwebsockets \
         libwebp \
+        libxml2 \
         libzip \
         chromaprint \
         nodejs \
+        protobuf-c \
+        redis \
+        sqlite-libs \
         tzdata
 
 COPY docker/php.ini /usr/local/etc/php/conf.d/99-velin.ini
@@ -91,6 +135,8 @@ COPY --from=source-verifier /source/public ./public
 COPY --from=source-verifier /source/support ./support
 COPY --from=source-verifier /source/bin/velin ./bin/velin
 COPY --from=source-verifier /source/bin/docker-bootstrap ./bin/docker-bootstrap
+COPY --from=source-verifier /source/bin/velin-airplay-companion ./bin/velin-airplay-companion
+COPY --from=source-verifier /source/bin/velin-redis-companion ./bin/velin-redis-companion
 COPY --from=source-verifier /source/bin/webdav-range-proxy.php ./bin/webdav-range-proxy.php
 COPY --from=source-verifier /source/artifacts/bin/linux-amd64/velin-dlna-helper ./bin/velin-dlna-helper
 COPY --from=source-verifier /source/artifacts/bin/linux-amd64/velin-library-watch-helper ./bin/velin-library-watch-helper
@@ -106,16 +152,19 @@ LABEL org.opencontainers.image.title="Velin Music" \
     org.opencontainers.image.version="${VELIN_VERSION}"
 WORKDIR /app
 COPY --from=vendor /app /app
+COPY --from=owntone-build /tmp/build/usr/ /usr/
+COPY --from=source-verifier --chmod=0644 /source/docker/owntone/owntone.conf /etc/owntone/owntone.conf
 COPY --from=source-verifier /source/database/migrations /opt/velin/migrations
 COPY --from=initial-plugin-build /out/ /opt/velin/initial-plugins/
 COPY --from=source-verifier /source/docker/entrypoint.sh /usr/local/bin/velin-entrypoint
 RUN set -eux; \
     chmod 0755 /usr/local/bin/velin-entrypoint /app/bin/velin /app/bin/docker-bootstrap /app/bin/ffmpeg /app/bin/ffprobe \
         /app/bin/fpcalc /app/bin/opencc /app/bin/velin-dlna-helper /app/bin/velin-library-watch-helper \
-        /app/bin/velin-media-gateway; \
+        /app/bin/velin-media-gateway /app/bin/velin-airplay-companion /app/bin/velin-redis-companion; \
     chmod 0555 /app/bin/webdav-range-proxy.php; \
     mkdir -p /data/config /data/database /data/runtime /data/plugins /data/cache/scrape \
-        /data/cache/artist-database /storage/music /storage/downloads; \
+        /data/cache/artist-database /data/cache/owntone /data/runtime/airplay /data/runtime/redis /data/redis \
+        /storage/music /storage/downloads; \
     ln -s /data /app/docker-data; \
     ln -s /storage /app/storage; \
     ln -s /data/database /app/database; \

@@ -57,6 +57,7 @@ use app\controller\Api\V1\Admin\JobController;
 use app\controller\Api\V1\Admin\ScanController;
 use app\controller\Api\V1\Admin\NetworkProxyController;
 use app\controller\Api\V1\Admin\SystemSettingsController;
+use app\controller\Api\V1\Admin\SystemHealthController;
 use app\controller\Api\V1\Admin\ResourcePluginController;
 use app\controller\Api\V1\Admin\OverviewController;
 use app\controller\Api\V1\Admin\PrivacyController;
@@ -275,6 +276,7 @@ Route::get('/api/v1/admin/system-errors', [SystemErrorController::class, 'index'
 Route::get('/api/v1/admin/system-errors/{errorId}', [SystemErrorController::class, 'show']);
 Route::patch('/api/v1/admin/system-errors/{errorId}', [SystemErrorController::class, 'update'])
     ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/system-health', [SystemHealthController::class, 'show']);
 Route::get('/api/v1/admin/overview', [OverviewController::class, 'show']);
 Route::get('/api/v1/admin/privacy/now-playing', [PrivacyController::class, 'nowPlaying']);
 Route::get('/api/v1/admin/privacy/users/{userId}/history', [PrivacyController::class, 'history']);
@@ -565,6 +567,9 @@ Route::put('/api/v1/admin/system-settings/limits', [SystemSettingsController::cl
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/system-settings/dlna', [SystemSettingsController::class, 'showDlna']);
 Route::put('/api/v1/admin/system-settings/dlna', [SystemSettingsController::class, 'updateDlna'])
+    ->middleware(VerifyCsrfToken::class);
+Route::get('/api/v1/admin/system-settings/airplay', [SystemSettingsController::class, 'showAirplay']);
+Route::put('/api/v1/admin/system-settings/airplay', [SystemSettingsController::class, 'updateAirplay'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/system-settings/proxy', [SystemSettingsController::class, 'showProxy']);
 Route::put('/api/v1/admin/system-settings/proxy', [SystemSettingsController::class, 'updateProxy'])

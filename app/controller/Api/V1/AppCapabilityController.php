@@ -9,6 +9,7 @@ use app\application\Auth\AuthorizationService;
 use app\application\System\BasicSystemSettingsService;
 use app\application\System\PublicUrlConfig;
 use app\application\System\DlnaSettingsService;
+use app\application\System\AirplaySettingsService;
 use app\http\JsonResponseFactory;
 use app\http\RequestContext;
 use support\Log;
@@ -30,6 +31,7 @@ final class AppCapabilityController
         $requestId = RequestContext::requestId();
         $external = self::externalTicketAvailable();
         $serverDlna = self::serverManagedDlnaAvailable();
+        $serverAirplay = self::serverManagedAirplayAvailable();
         return JsonResponseFactory::create(['data' => [
             'product' => 'Velin Music',
             'siteName' => self::configuredSiteName(),
@@ -42,7 +44,7 @@ final class AppCapabilityController
                 'catalog' => true, 'search' => true, 'queue' => true, 'favorites' => true,
                 'playlists' => true, 'bookmarks' => true, 'lyrics' => true, 'offlineManifest' => true,
                 'realtimeSse' => true, 'playbackExternalTicket' => $external,
-                'serverManagedDlna' => $serverDlna, 'serverManagedAirplay' => true,
+                'serverManagedDlna' => $serverDlna, 'serverManagedAirplay' => $serverAirplay,
             ],
             'outputScopes' => ['onDevice', 'nearbyNetwork', 'serverManaged'],
             'externalProtocols' => $external ? ['dlna', 'google_cast'] : [],
@@ -119,6 +121,16 @@ final class AppCapabilityController
     {
         try {
             return (new DlnaSettingsService())->get()['enabled'] === true;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /** 只在版本化全局设置明确开启且配置可读时声明服务端 AirPlay；进程故障由请求端稳定失败。 */
+    public static function serverManagedAirplayAvailable(): bool
+    {
+        try {
+            return (new AirplaySettingsService())->get()['enabled'] === true;
         } catch (\Throwable) {
             return false;
         }

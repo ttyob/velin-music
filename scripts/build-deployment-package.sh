@@ -53,7 +53,7 @@ printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
     exit 1
 }
 
-mkdir -p "$OUTPUT/bin" "$OUTPUT/docker/owntone" \
+mkdir -p "$OUTPUT/bin" \
     "$OUTPUT/docker-data/config" "$OUTPUT/docker-data/database" \
     "$OUTPUT/docker-data/runtime" "$OUTPUT/docker-data/plugins" "$OUTPUT/docker-data/cache" \
     "$OUTPUT/storage/music" "$OUTPUT/storage/downloads"
@@ -66,7 +66,6 @@ sed "s#^VELIN_BACKEND_IMAGE=.*#VELIN_BACKEND_IMAGE=$IMAGE#" \
 sed "s#<IMAGE>#${IMAGE}#g; s#<VERSION>#${VERSION}#g" \
     "$BACKEND_ROOT/docker/deployment/README.md" > "$OUTPUT/README.md"
 cp -- "$BACKEND_ROOT/bin/docker-bootstrap" "$OUTPUT/bin/docker-bootstrap"
-cp -- "$BACKEND_ROOT/docker/owntone/owntone.conf" "$OUTPUT/docker/owntone/owntone.conf"
 cp -- "$DATABASE_GITIGNORE" "$OUTPUT/docker-data/database/.gitignore"
 
 # 占位文件只保证两个 bind source 在解压后存在；容器首次启动负责建立受管子目录和生产密钥。
@@ -78,7 +77,7 @@ cp -- "$DATABASE_GITIGNORE" "$OUTPUT/docker-data/database/.gitignore"
 : > "$OUTPUT/storage/downloads/.gitkeep"
 chmod 0755 "$OUTPUT/bin/docker-bootstrap"
 chmod 0644 "$OUTPUT/compose.yaml" "$OUTPUT/.env.docker.example" "$OUTPUT/README.md" \
-    "$OUTPUT/docker/owntone/owntone.conf" "$OUTPUT/docker-data/database/.gitignore" \
+    "$OUTPUT/docker-data/database/.gitignore" \
     "$OUTPUT/docker-data/config/.gitkeep" "$OUTPUT/docker-data/runtime/.gitkeep" \
     "$OUTPUT/docker-data/plugins/.gitkeep" "$OUTPUT/docker-data/cache/.gitkeep" \
     "$OUTPUT/storage/music/.gitkeep" "$OUTPUT/storage/downloads/.gitkeep"

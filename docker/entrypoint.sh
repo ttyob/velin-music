@@ -40,6 +40,21 @@ fi
 cp -- "$DEPLOYMENT_ENV" /app/.env
 chmod 0400 /app/.env
 
+# Redis 是 backend 镜像的必需内部进程，持久文件直接位于统一 `/data/redis` 运行挂载，不再声明独立
+# Docker volume。旧命名卷只在维护窗口由宿主迁移一次；启动失败必须发生在迁移和任何业务 Worker 之前。
+# 初始化阶段若后续步骤失败，EXIT trap 会以 SIGTERM 停止 Redis 并等待刷盘；成功 exec Workerman 前移除
+# trap，运行期由单实例 RedisCompanionWorker 负责恢复和优雅停止。
+test -x /app/bin/velin-redis-companion
+test -x /usr/bin/redis-server
+test -x /usr/bin/redis-cli
+/app/bin/velin-redis-companion start
+cleanup_embedded_redis()
+{
+    /app/bin/velin-redis-companion stop || true
+}
+trap cleanup_embedded_redis EXIT
+trap 'exit 143' HUP INT TERM
+
 # Container startup is the only automatic migration boundary. Migrations modify SQLite, while media
 # directory provisioning remains owned by the dedicated scan Worker after Workerman starts. A failed
 # migration stops the container before any HTTP worker can serve an incompatible schema.
@@ -88,10 +103,21 @@ test -r /app/bin/opencc-data/tw2s.json
 test "$(printf '活著多好 - 陳奕迅\n' | /app/bin/opencc -c /app/bin/opencc-data/tw2s.json)" = '活着多好 - 陈奕迅'
 test -r /app/bin/webdav-range-proxy.php
 php -l /app/bin/webdav-range-proxy.php >/dev/null 2>&1
+test -x /app/bin/velin-airplay-companion
+test -x /usr/sbin/owntone
+test -x /usr/sbin/avahi-daemon
+test -x /usr/bin/dbus-daemon
+test -r /etc/owntone/owntone.conf
+test -r /usr/share/licenses/owntone/COPYING
+test "$(redis-cli -h 127.0.0.1 -p 27379 ping)" = PONG
 
 # DLNA 默认关闭以避免闲置 helper 占用内存。管理员在后台开启后，系统设置接口动态启动唯一常驻 daemon；
 # 关闭设置时发送停止信号并清理 Socket，已写入 Socket 的命令不得重试。
 
-# exec gives Workerman PID 1 signal ownership through Docker's init process, allowing graceful lease
-# release and SQLite checkpoint behavior during compose stop/restart.
+# AirPlay 同样默认关闭。单实例 Workerman 生命周期进程根据数据库设置启动或停止镜像内 OwnTone、Avahi
+# 与 D-Bus；入口只验证交付物，不预启动服务，也不要求 3689 在 backend 健康检查期间监听。
+
+# Workerman 的固定 Redis 生命周期 Worker 接管运行期恢复和退出刷盘后，入口移除初始化失败补偿 trap。
+# exec 让 Docker init 直接转发信号给 Workerman，以完成租约释放、SQLite checkpoint 和 Redis SIGTERM。
+trap - EXIT HUP INT TERM
 exec "$@"
