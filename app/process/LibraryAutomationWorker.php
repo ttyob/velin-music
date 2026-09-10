@@ -148,7 +148,7 @@ final class LibraryAutomationWorker
             $this->watcher = new LibraryWatchProcess(
                 $targets,
                 $this->helperPath,
-                StorageLayout::LIBRARY_ROOT,
+                StorageLayout::STORAGE_ROOT,
                 $this->watchDebounceMs,
             );
             $this->nextRestartAt = 0.0;

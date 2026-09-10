@@ -81,6 +81,8 @@ Route::get('/api/v1/setup', [SetupController::class, 'show']);
 Route::post('/api/v1/setup', [SetupController::class, 'create'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/setup/library', [SetupController::class, 'libraryShow']);
+Route::post('/api/v1/setup/library/directories/browse', [SetupController::class, 'browseLibraryDirectory'])
+    ->middleware(VerifyCsrfToken::class);
 Route::post('/api/v1/setup/library', [SetupController::class, 'configureLibrary'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/auth/csrf', [AuthController::class, 'csrf']);

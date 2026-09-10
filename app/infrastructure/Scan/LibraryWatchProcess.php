@@ -32,7 +32,7 @@ final class LibraryWatchProcess
     public function __construct(
         array $targets,
         ?string $binaryPath = null,
-        private readonly string $allowedRoot = StorageLayout::LIBRARY_ROOT,
+        private readonly string $allowedRoot = StorageLayout::STORAGE_ROOT,
         private readonly int $debounceMs = 2_000,
     ) {
         $path = $binaryPath ?? (string) (getenv('VELIN_LIBRARY_WATCH_HELPER_PATH')

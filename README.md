@@ -1,4 +1,4 @@
-# Velin Music 0.1.30
+# Velin Music 0.1.31
 
 <p align="center">
   <strong>自托管音乐库、播放器与媒体服务</strong><br>
@@ -92,7 +92,7 @@ Redis、OwnTone、Avahi 与 D-Bus 已包含在同一个 backend 镜像中。覆�
 与校验信息。
 
 公开 `main` 始终对应最近一次稳定导出。需要精确复现版本时使用
-`git clone --branch v0.1.30 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
+`git clone --branch v0.1.31 --depth 1 https://github.com/ttyob/velin-music.git`；稳定 Git 标签与同版本
 镜像标签均禁止覆盖。
 
 ### 使用 Release 精简部署包
@@ -101,7 +101,7 @@ Release 部署包只包含 Compose、初始化脚本和空持久目录，其中 
 digest。源码无需重复打包，可直接使用公开仓库或 GitHub 自动生成的 Source code 附件。
 
 ```bash
-VERSION=0.1.30
+VERSION=0.1.31
 curl -fL -o "velin-music-deploy-${VERSION}.tar.gz" \
   "https://github.com/ttyob/velin-music/releases/download/v${VERSION}/velin-music-deploy-${VERSION}.tar.gz"
 tar -xzf "velin-music-deploy-${VERSION}.tar.gz"
