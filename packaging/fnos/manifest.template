@@ -1,0 +1,14 @@
+appname         = velin-music
+version         = @VERSION@
+display_name    = Velin Music
+platform        = x86
+maintainer      = ttyob
+maintainer_url  = https://github.com/ttyob/velin-music
+distributor     = ttyob
+distributor_url = https://github.com/ttyob/velin-music
+desktop_uidir   = ui
+desktop_applaunchname = velin-music.Application
+service_port    = 8787
+desc            = 私有部署的音乐管理、流媒体与多端播放服务
+source          = thirdparty
+checksum        = @CHECKSUM@

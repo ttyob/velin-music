@@ -132,11 +132,12 @@ final class SetupController
     }
 
     /**
-     * 返回登录后首次配置默认音乐库所需的选择器边界和 CSRF 令牌。
+     * 返回登录后首次配置默认音乐库所需的选择器边界、策略白名单和 CSRF 令牌。
      *
      * 该入口只对尚未建立默认库的超级管理员开放。`browseRootPath` 是容器内固定逻辑挂载，不是宿主物理
      * 路径；前端只能结合目录浏览接口返回的相对路径展示选择结果。默认库完成后返回 404，避免保留一个
-     * 可探测的特权初始化入口。本方法只读取设置状态和 Session，不访问媒体目录。
+     * 可探测的特权初始化入口。策略默认值与提交白名单一起返回，前端不能自行扩展枚举。本方法只读取
+     * 设置状态和 Session，不访问媒体目录。
      */
     public function libraryShow(Request $request): Response
     {
@@ -150,7 +151,11 @@ final class SetupController
                     'required' => true,
                     'csrfToken' => (new CsrfTokenManager())->getOrCreate($request->session()),
                     'browseRootPath' => '/storage',
-                    'defaultRelativePath' => '',
+                    'defaultRelativePath' => 'music',
+                    'defaultScrapeStorageMode' => 'managed_cache',
+                    'scrapeStorageModes' => ['managed_cache', 'adjacent'],
+                    'defaultScanMode' => 'manual',
+                    'scanModes' => ['manual', 'scheduled', 'watch'],
                 ],
                 'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')],
             ], 200, $requestId);
@@ -200,11 +205,11 @@ final class SetupController
     }
 
     /**
-     * 保存目录选择器确认的默认音乐库并开放普通业务 API。
+     * 保存目录选择器确认的默认音乐库、派生资源策略和扫描模式，并开放普通业务 API。
      *
      * 当前主体必须仍是超级管理员且默认库尚未建立；请求路径即使来自受控选择器，也必须再次经过格式、
-     * 真实路径、权限、缓存隔离和事务内并发复验。成功会原子写入库、管理员授权、默认指针和审计；失败
-     * 回滚所有数据库写入且不创建、移动或修改媒体文件。
+     * 真实路径、策略对应的读写权限、缓存隔离和事务内并发复验。成功会原子写入库、管理员授权、默认
+     * 指针和审计；失败回滚所有数据库写入且不创建、移动或修改媒体文件，也不会在请求内启动扫描。
      */
     public function configureLibrary(Request $request): Response
     {
@@ -215,7 +220,7 @@ final class SetupController
         $payload = $request->post();
         $validation = (new SetupLibraryValidator())->validate(is_array($payload) ? $payload : []);
         if (!$validation->isValid() || $validation->input === null) {
-            return JsonResponseFactory::error('VALIDATION_FAILED', '请检查音乐库目录。', 422, $requestId, ['fields' => $validation->errors]);
+            return JsonResponseFactory::error('VALIDATION_FAILED', '请检查音乐库设置。', 422, $requestId, ['fields' => $validation->errors]);
         }
         try {
             (new SetupService())->configureDefaultLibrary($validation->input, $actor, $requestId);

@@ -1,0 +1,27 @@
+[
+  {
+    "stepTitle": "卸载 Velin Music",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_data_action",
+        "label": "应用数据处理",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "保留应用数据（推荐）",
+            "value": "keep"
+          },
+          {
+            "label": "清理应用数据",
+            "value": "delete"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "清理会永久删除 Velin Music 的 SQLite 数据库、登录密钥、Redis 数据、插件、独立缓存和运行文件，且无法恢复。安装时映射的音乐库目录及其中所有文件（包括同目录歌词和封面）始终保留。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eu
+
+# 升级前先复验已保存的安装向导目录，防止挂载消失时 Docker 以空目录启动并触发错误扫描。
+. "$(dirname -- "$0")/storage-layout"
+velin_prepare_storage_layout

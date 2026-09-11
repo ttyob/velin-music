@@ -1,0 +1,48 @@
+[
+  {
+    "stepTitle": "Velin Music",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "Velin Music 使用单个 Docker 容器运行，Web 地址为 <code>http://&lt;NAS地址&gt;:8787/</code>。当前安装包只支持 x86_64 飞牛设备。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "存储设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "应用数据包含 SQLite、配置、Redis、插件和缓存。应用数据目录留空时使用 fnOS 分配的 <code>@appdata/velin-music/docker-data</code>；音乐库目录必须填写 NAS 上已经存在的目录，例如 <code>/vol3/1000/歌曲</code>。容器内分别固定显示为 <code>/data</code> 和 <code>/storage</code>。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_dir",
+        "label": "应用数据目录（留空使用 fnOS 默认目录）",
+        "initValue": "",
+        "rules": [
+          {
+            "pattern": "^$|^/vol[0-9]+/[^\"$\\\\:]+$",
+            "message": "请输入 /vol数字/目录 形式的现有绝对路径，或留空使用默认目录"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_storage_dir",
+        "label": "音乐库目录",
+        "initValue": "",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入音乐库目录"
+          },
+          {
+            "pattern": "^/vol[0-9]+/[^\"$\\\\:]+$",
+            "message": "请输入 /vol数字/目录 形式的现有绝对路径"
+          }
+        ]
+      }
+    ]
+  }
+]

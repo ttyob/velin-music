@@ -7,9 +7,9 @@ namespace app\application\Library;
 /**
  * Carries a validated optimistic library update.
  *
- * 默认库只允许修改刮削资源、符号链接和扫描策略；身份、路径及语言保持为空，服务层会拒绝夹带受
- * 保护字段。自定义库使用完整替换，网络库的远端元数据模式也必须明确冻结，避免旧页面静默恢复
- * 会访问音频正文的 Range 探测。
+ * 默认库允许修改本地根目录、刮削资源、符号链接和扫描策略；名称、来源及语言保持为空，服务层会
+ * 拒绝夹带受保护字段，并在存在媒体或库存事实时拒绝换根。自定义库使用完整替换，网络库的远端元
+ * 数据模式也必须明确冻结，避免旧页面静默恢复会访问音频正文的 Range 探测。
  */
 final readonly class LibraryUpdateInput
 {

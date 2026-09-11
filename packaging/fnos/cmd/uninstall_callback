@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+
+# Docker 项目停止并移除后才按向导选择清理应用数据；音乐库根不在删除列表中且始终保留。
+. "$(dirname -- "$0")/uninstall-storage"
+velin_delete_managed_data
+exit 0

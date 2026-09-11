@@ -1,0 +1,16 @@
+#!/bin/bash
+set -u
+
+# Docker 项目由 fnOS 应用中心负责启停；本脚本只提供精确容器状态，不另起 Compose 进程。
+case "${1:-}" in
+  start|stop)
+    exit 0
+    ;;
+  status)
+    [ "$(docker inspect --format '{{.State.Running}}' velin-music 2>/dev/null)" = "true" ] && exit 0
+    exit 3
+    ;;
+  *)
+    exit 1
+    ;;
+esac

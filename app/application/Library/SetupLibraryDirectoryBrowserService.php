@@ -9,11 +9,12 @@ use FilesystemIterator;
 use Throwable;
 
 /**
- * 为首次初始化提供固定媒体挂载内的只读目录浏览。
+ * 为首次初始化和后台音乐库根选择提供固定媒体挂载内的只读目录浏览。
  *
  * 浏览根固定为容器内 `/storage`，浏览器只提交根内相对目录，不能请求 `/data`、宿主绝对路径或 URL。
  * 服务每次访问都重新解析真实路径，并逐段拒绝符号链接，避免安装期间目录被替换后越过媒体挂载边界。
  * 返回值只包含逻辑路径、条目类型、大小和修改时间，不创建目录、不读取文件正文，也不修改任何业务数据。
+ * `/storage/downloads` 与回收站属于核心保留区，在根列表中不投影，避免界面把中间文件目录误选为音乐库。
  */
 final readonly class SetupLibraryDirectoryBrowserService
 {
@@ -70,6 +71,7 @@ final readonly class SetupLibraryDirectoryBrowserService
             try {
                 $name = $entry->getFilename();
                 if (!$this->validOutputName($name)) continue;
+                if ($relativePath === '' && in_array($name, ['downloads', '.velin-trash'], true)) continue;
                 $path = $relativePath === '' ? $name : $relativePath . '/' . $name;
                 $this->assertRelativePath($path);
                 $isLink = $entry->isLink();

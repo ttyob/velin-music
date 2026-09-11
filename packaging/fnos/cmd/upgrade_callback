@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eu
+
+# 升级后只补齐后来新增的受管目录，不删除或改写任何已有业务数据或媒体。
+. "$(dirname -- "$0")/storage-layout"
+velin_prepare_storage_layout

@@ -1,7 +1,7 @@
-# Velin Music Docker 精简部署包 0.1.31
+# Velin Music Docker 精简部署包 0.1.37
 
 这个目录只包含 Docker Compose、初始化脚本和空持久目录，不重复包含 GitHub 标签已经
-提供的公开源码。Compose 只拉取已经由 CI 构建的 backend 镜像 `ghcr.io/ttyob/velin-music:0.1.31`，不会在部署主机重新安装依赖
+提供的公开源码。Compose 只拉取已经由 CI 构建的 backend 镜像 `ghcr.io/ttyob/velin-music:0.1.37`，不会在部署主机重新安装依赖
 或构建源码。当前公开平台为 `linux/amd64`。
 
 ## 启动

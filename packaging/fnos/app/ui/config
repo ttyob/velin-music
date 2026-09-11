@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "velin-music.Application": {
+      "title": "Velin Music",
+      "desc": "Velin Music",
+      "icon": "images/{0}.png?v=@VERSION@",
+      "type": "url",
+      "port": "8787",
+      "protocol": "http",
+      "url": "/",
+      "allUsers": true
+    }
+  }
+}

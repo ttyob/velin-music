@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -eu
+
+# 删除容器项目前只做完整预检；默认保留直接成功，显式清理存在任何边界异常则阻止卸载继续。
+. "$(dirname -- "$0")/uninstall-storage"
+velin_prepare_data_cleanup || true
+exit 0

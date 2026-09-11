@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eu
+
+# Docker 项目创建后再次复验同一双根合同；初始化可重复执行，不覆盖配置、数据库、Redis 或媒体文件。
+. "$(dirname -- "$0")/storage-layout"
+velin_prepare_storage_layout

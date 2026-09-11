@@ -90,9 +90,10 @@ final class SetupService
     /**
      * 由已登录超级管理员完成首次默认音乐库配置。
      *
-     * 前置条件是首个管理员已经存在且当前没有有效默认库；路径在写事务前后均解析并检查缓存隔离，
-     * 随后与库记录、管理员 manage 授权、默认库指针和审计在同一短事务提交。任一步失败都会回滚，
-     * 不创建目录、不移动媒体，也不会把普通账号升级为管理员。
+     * 前置条件是首个管理员已经存在且当前没有有效默认库；路径在写事务前后均解析并检查缓存、下载隔离。
+     * 独立缓存只要求媒体可读，相邻模式因歌词和封面会发布到媒体旁而要求目录可写。随后库记录、管理员
+     * manage 授权、默认库指针和审计在同一短事务提交。任一步失败都会回滚，不创建目录、不移动媒体，
+     * 也不会把普通账号升级为管理员；扫描模式只保存策略，不在请求内启动扫描。
      *
      * @param array<string,mixed> $actor 当前认证主体
      * @return string 动态生成的音乐库 ULID
@@ -102,7 +103,7 @@ final class SetupService
         if (($actor['isSuperAdmin'] ?? false) !== true || !is_string($actor['id'] ?? null)) {
             throw new \RuntimeException('Only a super administrator may configure the default library.');
         }
-        $resolvedRoot = $this->resolveSetupLibraryRoot($input->rootPath);
+        $resolvedRoot = $this->resolveSetupLibraryRoot($input->rootPath, $input->scrapeStorageMode);
         $libraryId = (string) new Ulid();
         $now = gmdate('Y-m-d\TH:i:s\Z');
         $pdo = Db::connection()->getPdo();
@@ -113,6 +114,10 @@ final class SetupService
             if ((new DefaultLibraryService())->id() !== null) {
                 throw new SetupAlreadyCompleted('Default library is already configured.');
             }
+            $lockedResolvedRoot = $this->resolveSetupLibraryRoot($input->rootPath, $input->scrapeStorageMode);
+            if ($lockedResolvedRoot !== $resolvedRoot) {
+                throw new \RuntimeException('音乐库目录在确认期间发生变化。');
+            }
             $this->assertSetupLibraryAvailable($pdo, $resolvedRoot);
             Db::table('music_libraries')->insert([
                 'id' => $libraryId,
@@ -121,14 +126,14 @@ final class SetupService
                 'resolved_inbox_path' => null,
                 'root_path' => $input->rootPath,
                 'resolved_root_path' => $resolvedRoot,
-                'scrape_storage_mode' => 'managed_cache',
+                'scrape_storage_mode' => $input->scrapeStorageMode,
                 'source_type' => 'local',
                 'remote_metadata_mode' => 'filename_only',
                 'proxy_profile_id' => null,
                 'status' => 'active',
                 'symlink_policy' => 'ignore',
                 'default_locale' => 'zh-CN',
-                'scan_mode' => 'manual',
+                'scan_mode' => $input->scanMode,
                 'scan_status' => 'never_scanned',
                 'artist_count' => 0,
                 'album_count' => 0,
@@ -164,12 +169,28 @@ final class SetupService
         return $libraryId;
     }
 
-    private function resolveSetupLibraryRoot(string $rootPath): string
+    /**
+     * 解析首次库目录并实施所选派生资源策略的最小权限。
+     *
+     * `managed_cache` 的歌词和封面写入固定 `/data/cache/scrape`，媒体根只需可读；`adjacent` 会在歌曲
+     * 旁原子发布文件，因此必须可写。该方法不创建目录或探测媒体内容，路径缺失、权限不足或与缓存、
+     * 插件下载根双向包含时抛错，由外层事务回滚数据库写入。
+     */
+    private function resolveSetupLibraryRoot(string $rootPath, string $scrapeStorageMode): string
     {
-        $resolved = $this->libraryPaths->resolveMediaDirectory($rootPath, '音乐库目录', false);
+        $resolved = $this->libraryPaths->resolveMediaDirectory(
+            $rootPath,
+            '音乐库目录',
+            $scrapeStorageMode === 'adjacent',
+        );
         $cache = realpath(StorageLayout::SCRAPE_CACHE_ROOT);
         if ($cache !== false && $this->libraryPaths->overlaps($resolved, $cache)) {
             throw new \RuntimeException('音乐库目录不能与刮削缓存目录重叠。');
+        }
+        $downloads = realpath(StorageLayout::DOWNLOAD_ROOT);
+        $downloads = $downloads === false ? StorageLayout::DOWNLOAD_ROOT : $downloads;
+        if ($this->libraryPaths->overlaps($resolved, rtrim($downloads, DIRECTORY_SEPARATOR))) {
+            throw new \RuntimeException('音乐库目录不能与插件下载目录重叠。');
         }
         return $resolved;
     }

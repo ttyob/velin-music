@@ -199,7 +199,7 @@ final class LibraryManagementService
             $preflightRoot = 'google_drive://' . $libraryId . '/';
         } else {
             $preflightRoot = $this->resolveLibraryRoot($input->rootPath, $input->scrapeStorageMode);
-            $this->assertCacheSeparated($preflightRoot);
+            $this->assertManagedStorageSeparated($preflightRoot);
         }
         $pdo = Db::connection()->getPdo();
         $transactionOpen = false;
@@ -226,7 +226,7 @@ final class LibraryManagementService
                     '',
                 );
             } else {
-                $this->assertCacheSeparated($resolvedRoot);
+                $this->assertManagedStorageSeparated($resolvedRoot);
                 $this->assertPathAvailable($resolvedRoot, '');
             }
 
@@ -352,9 +352,10 @@ final class LibraryManagementService
     /**
      * Updates one library under optimistic locking and global path-overlap protection.
      *
-     * 默认库只接受刮削资源、符号链接和扫描策略，身份、路径及语言保持固定。自定义库采用完整替换；
-     * 已有媒体或升级期路径事实后拒绝直接换根，因为重定位需要独立迁移方案。`adjacent` 切换还会复验
-     * 当前根可写。文件系统解析在 `BEGIN IMMEDIATE` 前后各执行一次，事务本身不执行文件写入。
+     * 默认库保持身份、名称、来源和语言，但可在没有媒体或库存事实时更换本地根；自定义库采用完整
+     * 替换。已有路径绑定事实后拒绝直接换根，因为重定位需要独立迁移方案。`adjacent` 切换还会复验
+     * 当前根可写。文件系统解析在 `BEGIN IMMEDIATE` 前后各执行一次，事务本身不执行文件写入；失败
+     * 回滚全部库字段和审计，不移动、删除或重新解释任何媒体文件。
      *
      * @param array<string, mixed> $payload Untrusted parsed request body.
      * @param array<string, mixed> $actor Authorized manage_library principal.
@@ -380,11 +381,24 @@ final class LibraryManagementService
             throw new LibraryConflict('音乐库来源类型不能直接转换，请新建音乐库。');
         }
         if ($input->defaultOnly) {
-            $resolvedRoot = $this->resolveLibraryRoot((string) $current['rootPath'], $input->scrapeStorageMode);
-            $this->assertCacheSeparated($resolvedRoot);
-            Db::transaction(function () use ($actor, $input, $libraryId, $requestId): void {
+            $preflightRoot = $this->resolveLibraryRoot((string) $input->rootPath, $input->scrapeStorageMode);
+            $this->assertManagedStorageSeparated($preflightRoot);
+            $pdo = Db::connection()->getPdo();
+            $transactionOpen = false;
+            $pdo->exec('BEGIN IMMEDIATE');
+            $transactionOpen = true;
+            try {
+                $resolvedRoot = $this->resolveLibraryRoot((string) $input->rootPath, $input->scrapeStorageMode);
+                $this->assertManagedStorageSeparated($resolvedRoot);
+                $this->assertPathAvailable($resolvedRoot, $libraryId);
+                $pathChanged = $resolvedRoot !== (string) $current['resolvedRootPath'];
+                if ($pathChanged && $this->libraryHasPathBoundFacts($libraryId)) {
+                    throw new LibraryConflict('默认音乐库已有媒体记录，不能直接修改目录。');
+                }
                 $changed = Db::table('music_libraries')->where('id', $libraryId)
                     ->where('version', $input->expectedVersion)->update([
+                        'root_path' => $input->rootPath,
+                        'resolved_root_path' => $resolvedRoot,
                         'scan_mode' => $input->scanMode,
                         'scrape_storage_mode' => $input->scrapeStorageMode,
                         'symlink_policy' => $input->symlinkPolicy,
@@ -397,11 +411,17 @@ final class LibraryManagementService
                 }
                 $this->auditLogger->record((string) $actor['id'], 'library.update.default', 'music_library',
                     $libraryId, 'success', $requestId, [
+                        'pathChanged' => $pathChanged,
                         'scanMode' => $input->scanMode,
                         'scrapeStorageMode' => $input->scrapeStorageMode,
                         'symlinkPolicy' => $input->symlinkPolicy,
                     ]);
-            });
+                $pdo->exec('COMMIT');
+                $transactionOpen = false;
+            } catch (Throwable $throwable) {
+                if ($transactionOpen) $pdo->exec('ROLLBACK');
+                throw $throwable;
+            }
 
             return $this->findManagedLibrary($libraryId, $actor);
         }
@@ -417,14 +437,14 @@ final class LibraryManagementService
         }
 
         $preflightRoot = $this->resolveLibraryRoot((string) $input->rootPath, $input->scrapeStorageMode);
-        $this->assertCacheSeparated($preflightRoot);
+        $this->assertManagedStorageSeparated($preflightRoot);
         $pdo = Db::connection()->getPdo();
         $transactionOpen = false;
         $pdo->exec('BEGIN IMMEDIATE');
         $transactionOpen = true;
         try {
             $resolvedRoot = $this->resolveLibraryRoot((string) $input->rootPath, $input->scrapeStorageMode);
-            $this->assertCacheSeparated($resolvedRoot);
+            $this->assertManagedStorageSeparated($resolvedRoot);
             $this->assertPathAvailable($resolvedRoot, $libraryId);
             $pathChanged = $resolvedRoot !== (string) $current['resolvedRootPath'];
             if ($pathChanged && $this->libraryHasPathBoundFacts($libraryId)) {
@@ -741,13 +761,24 @@ final class LibraryManagementService
         );
     }
 
-    /** 固定缓存根不能等于或包含媒体库；缺失缓存由部署/启动预检报告，而不是 HTTP 请求创建。 */
-    private function assertCacheSeparated(string $resolvedRoot): void
+    /**
+     * 固定缓存和下载根都不能与媒体库相同或互相包含。
+     *
+     * 刮削缓存缺失由部署预检报告；下载根即使尚未建立也按固定逻辑路径比较，防止管理员先登记
+     * `/storage`，随后启动插件时才发现工作区与媒体库重叠。这里只比较规范路径，不创建或修改目录。
+     */
+    private function assertManagedStorageSeparated(string $resolvedRoot): void
     {
         $configured = StorageLayout::SCRAPE_CACHE_ROOT;
         $cache = realpath($configured);
         if ($cache !== false && $this->paths->overlaps($resolvedRoot, $cache)) {
             throw new LibraryConflict('音乐库目录不能与刮削缓存目录相同或互相包含。');
+        }
+        $configured = StorageLayout::DOWNLOAD_ROOT;
+        $downloads = realpath($configured);
+        $downloads = $downloads === false ? $configured : $downloads;
+        if ($this->paths->overlaps($resolvedRoot, rtrim($downloads, DIRECTORY_SEPARATOR))) {
+            throw new LibraryConflict('音乐库目录不能与插件下载目录相同或互相包含。');
         }
     }
 

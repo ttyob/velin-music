@@ -191,8 +191,10 @@ final class LibraryValidator
     /**
      * Validates an optimistic edit using a strict command-specific field allowlist.
      *
-     * 默认库只接受刮削资源模式、符号链接、扫描模式和期望版本。接受后忽略多余字段会让受损或过期
-     * 页面误以为已经修改受保护身份和路径，因此必须失败关闭。自定义库使用完整替换并复用创建约束。
+     * 默认库保持稳定身份、名称、来源和语言，但允许在尚无路径绑定事实时更换本地根目录；根目录必须
+     * 由客户端显式提交，后续仍由服务层在写锁前后复验真实路径、保留目录和全局重叠。接受后忽略多余
+     * 字段会让受损或过期页面误以为已经修改受保护身份，因此必须失败关闭。自定义库使用完整替换并复用
+     * 创建约束。
      *
      * @param array<string, mixed> $payload Parsed untrusted JSON input.
      */
@@ -203,7 +205,7 @@ final class LibraryValidator
     ): LibraryUpdateValidationResult
     {
         $allowed = $defaultOnly
-            ? ['scrapeStorageMode', 'symlinkPolicy', 'scanMode', 'expectedVersion']
+            ? ['rootPath', 'scrapeStorageMode', 'symlinkPolicy', 'scanMode', 'expectedVersion']
             : ['name', 'sourceType', 'rootPath', 'scrapeStorageMode', 'symlinkPolicy', 'defaultLocale',
                 'scanMode', 'webDavBaseUrl', 'webDavUsername', 'webDavPassword', 'webDavVerifyTls',
                 'oneDriveTenantId', 'oneDriveClientId', 'oneDriveAuthorizationId', 'remoteMetadataMode',
@@ -230,7 +232,14 @@ final class LibraryValidator
             $errors['scrapeStorageMode'][] = '请选择独立缓存或媒体同目录模式。';
         }
         if ($defaultOnly) {
+            $rootPath = trim($this->stringValue($payload, 'rootPath'));
             $symlinkPolicy = trim($this->stringValue($payload, 'symlinkPolicy'));
+            if ($currentSourceType !== 'local') {
+                $errors['request'][] = '默认音乐库必须保持为本地目录来源。';
+            }
+            if ($rootPath === '' || strlen($rootPath) > 4096 || str_contains($rootPath, "\0")) {
+                $errors['rootPath'][] = '请选择有效的音乐库目录。';
+            }
             if (!in_array($symlinkPolicy, ['ignore', 'within_root'], true)) {
                 $errors['symlinkPolicy'][] = '请选择受支持的符号链接策略。';
             }
@@ -240,6 +249,7 @@ final class LibraryValidator
                     scanMode: $scanMode,
                     scrapeStorageMode: $scrapeStorageMode,
                     symlinkPolicy: $symlinkPolicy,
+                    rootPath: $rootPath,
                     defaultOnly: true,
                 ), [])
                 : new LibraryUpdateValidationResult(null, $errors);

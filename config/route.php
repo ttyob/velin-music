@@ -58,6 +58,7 @@ use app\controller\Api\V1\Admin\ScanController;
 use app\controller\Api\V1\Admin\NetworkProxyController;
 use app\controller\Api\V1\Admin\SystemSettingsController;
 use app\controller\Api\V1\Admin\SystemHealthController;
+use app\controller\Api\V1\Admin\ReleaseUpdateController;
 use app\controller\Api\V1\Admin\ResourcePluginController;
 use app\controller\Api\V1\Admin\OverviewController;
 use app\controller\Api\V1\Admin\PrivacyController;
@@ -279,6 +280,7 @@ Route::get('/api/v1/admin/system-errors/{errorId}', [SystemErrorController::clas
 Route::patch('/api/v1/admin/system-errors/{errorId}', [SystemErrorController::class, 'update'])
     ->middleware(VerifyCsrfToken::class);
 Route::get('/api/v1/admin/system-health', [SystemHealthController::class, 'show']);
+Route::get('/api/v1/admin/release-update', [ReleaseUpdateController::class, 'show']);
 Route::get('/api/v1/admin/overview', [OverviewController::class, 'show']);
 Route::get('/api/v1/admin/privacy/now-playing', [PrivacyController::class, 'nowPlaying']);
 Route::get('/api/v1/admin/privacy/users/{userId}/history', [PrivacyController::class, 'history']);
@@ -410,6 +412,8 @@ Route::post('/api/v1/admin/uploads/{sessionId}/publish', [AdminUploadController:
 Route::post('/api/v1/admin/uploads/{sessionId}/cancel', [AdminUploadController::class, 'cancel'])
     ->middleware(VerifyCsrfToken::class);
 Route::post('/api/v1/admin/libraries', [LibraryController::class, 'create'])
+    ->middleware(VerifyCsrfToken::class);
+Route::post('/api/v1/admin/library-roots/browse', [LibraryController::class, 'browseRootDirectory'])
     ->middleware(VerifyCsrfToken::class);
 Route::post('/api/v1/admin/libraries/{libraryId}/directories/browse', [LibraryController::class, 'browseDirectory'])
     ->middleware(VerifyCsrfToken::class);

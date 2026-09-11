@@ -143,6 +143,13 @@ jobs:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
 
+      - name: Set up PHP for fnOS package validation
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: gd
+          coverage: none
+
       - name: Build immutable deployment assets
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -158,7 +165,11 @@ jobs:
             "$package_root"
           tar -C "$RUNNER_TEMP" -czf "$asset_root/velin-music-deploy-$RELEASE_VERSION.tar.gz" \
             "velin-music-deploy-$RELEASE_VERSION"
-          (cd "$asset_root" && sha256sum ./*.tar.gz > SHA256SUMS)
+          scripts/build-fnos-fpk.sh \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            "$RELEASE_VERSION" \
+            "$asset_root/velin-music_${RELEASE_VERSION}_x86.fpk"
+          (cd "$asset_root" && sha256sum ./*.tar.gz ./*.fpk > SHA256SUMS)
           printf 'asset_root=%s\n' "$asset_root" >> "$GITHUB_ENV"
 
       - name: Create immutable GitHub release
@@ -174,10 +185,12 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" \
             "$asset_root"/velin-music-deploy-"$RELEASE_VERSION".tar.gz \
+            "$asset_root"/velin-music_"$RELEASE_VERSION"_x86.fpk \
+            "$asset_root"/velin-music_"$RELEASE_VERSION"_x86.fpk.sha256 \
             "$asset_root"/SHA256SUMS \
             --verify-tag \
             --title "Velin Music $RELEASE_VERSION" \
-            --notes "Velin Music $RELEASE_VERSION：linux/amd64 镜像和 digest 固定精简部署包；源码使用 GitHub 自动生成的 Source code 附件。公开插件包请从独立插件仓库获取。"
+            --notes "Velin Music $RELEASE_VERSION：linux/amd64 镜像、digest 固定精简部署包和同 digest 的 x86 fnOS FPK；源码使用 GitHub 自动生成的 Source code 附件。公开插件包请从独立插件仓库获取。"
 
   # 服务器部署是可选的外部副作用；只有仓库变量显式设置 DEPLOY_ENABLED=true 才会执行。部署先拉取新
   # digest，再停 backend 制作 SQLite 冷备份；停止后的任一步骤失败都恢复旧环境。新 backend 已经启动

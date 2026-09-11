@@ -1,0 +1,20 @@
+#!/bin/bash
+set -eu
+
+# fnOS 在 install_callback 之前解析并创建 Docker 项目，因此必须在 install_init 阶段校验向导目录并
+# 建立默认 /data 宿主目录。公共校验器只补齐 Velin 自有空目录，不覆盖密钥、SQLite、插件或 Redis；
+# 后续 Docker 初始化失败时，fnOS 可回滚套件元数据，目录内已有文件仍不会被本脚本删除。
+command -v docker >/dev/null 2>&1 || {
+  echo "Velin Music 需要先启用 fnOS Docker 服务。" >&2
+  exit 1
+}
+case "$(uname -m)" in
+  x86_64|amd64) ;;
+  *)
+    echo "当前 Velin Music FPK 仅支持 x86_64。" >&2
+    exit 1
+    ;;
+esac
+
+. "$(dirname -- "$0")/storage-layout"
+velin_prepare_storage_layout

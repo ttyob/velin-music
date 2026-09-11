@@ -18,6 +18,7 @@ use app\application\Library\LibraryValidator;
 use app\application\Library\OneDriveAuthorizationFailed;
 use app\application\Library\GoogleDriveAuthorizationFailed;
 use app\application\Library\RemoteLibraryUnavailable;
+use app\application\Library\SetupLibraryDirectoryBrowserService;
 use app\http\JsonResponseFactory;
 use app\http\RequestContext;
 use support\Log;
@@ -81,6 +82,37 @@ final class LibraryController
                 'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')]], 200, $requestId);
         } catch (Throwable $throwable) {
             return $this->mapFailure($throwable, $requestId, 'Library directory browse request failed.');
+        }
+    }
+
+    /**
+     * 从固定 `/storage` 挂载中浏览可登记为本地音乐库根的目录。
+     *
+     * 该入口要求 `manage_library` 和 CSRF，只接受正文中的相对路径及分页参数；浏览器不能提交宿主路径、
+     * URL 或文件命令。服务端逐段拒绝链接与越界，并隐藏下载和回收保留区。返回仅供选择器使用，保存时
+     * `LibraryManagementService` 仍在写锁前后复验真实路径、权限、路径绑定事实和全局重叠。本方法只读，
+     * 失败不会创建目录、修改库配置或触发扫描。
+     */
+    public function browseRootDirectory(Request $request): Response
+    {
+        $requestId = RequestContext::requestId();
+        try {
+            (new AuthorizationService())->requireCapability($request, 'manage_library');
+            $payload = $request->post();
+            if (!is_array($payload) || array_diff(array_keys($payload), ['path', 'limit', 'offset']) !== []) {
+                throw new LibraryDirectoryBrowseFailed('LIBRARY_ROOT_DIRECTORY_REQUEST_INVALID', '目录浏览请求格式无效。');
+            }
+            $path = $payload['path'] ?? '';
+            $limit = $payload['limit'] ?? 100;
+            $offset = $payload['offset'] ?? 0;
+            if (!is_string($path) || !is_int($limit) || !is_int($offset)) {
+                throw new LibraryDirectoryBrowseFailed('LIBRARY_ROOT_DIRECTORY_REQUEST_INVALID', '目录浏览请求格式无效。');
+            }
+            $data = (new SetupLibraryDirectoryBrowserService())->browse($path, $limit, $offset);
+            return JsonResponseFactory::create(['data' => $data,
+                'meta' => ['requestId' => $requestId, 'timestamp' => gmdate('c')]], 200, $requestId);
+        } catch (Throwable $throwable) {
+            return $this->mapFailure($throwable, $requestId, 'Library root directory browse request failed.');
         }
     }
 
